@@ -4,3 +4,4 @@ httpx
 groq
 supabase
 python-dotenv
+apscheduler
