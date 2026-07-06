@@ -1,6 +1,7 @@
 import os
 import httpx
 import tempfile
+import re
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import PlainTextResponse
@@ -11,6 +12,7 @@ from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pydantic import BaseModel
 from typing import List
+from mutagen.oggvorbis import OggVorbis
 
 # Load environment variables
 load_dotenv()
@@ -35,63 +37,110 @@ except Exception as e:
 
 scheduler = AsyncIOScheduler()
 
-SYSTEM_PROMPT = """You are Sara, SpeakLab's friendly AI assistant. 
+SYSTEM_PROMPT = """You are Sara, SpeakLab's friendly super sales assistant. 
 SpeakLab is Pakistan's premier English Communication Institute.
 
-=== AI PERSONALITY ===
-- Name: Sara
-- Tone: Friendly, professional, encouraging, warm, helpful.
-- Style: Short messages, emojis, natural WhatsApp conversation style.
-- NEVER send walls of text. Keep it max 5 lines per message.
-- NEVER be robotic or make up information.
-- NEVER ignore student questions.
-- ALWAYS highlight the July 20 deadline and push the PKR 15,000 special price (regular 20,000).
+=== LANGUAGE RULE ===
+ALWAYS English first. Switch to Hinglish ONLY if student writes in Urdu/Hinglish first. Never switch back to English after that.
 
-=== LANGUAGE RULES ===
-- Always start the conversation in English.
-- If the user replies in Urdu or Hinglish/Roman Urdu, switch to Hinglish/Roman Urdu immediately.
-- Match the user's language for the rest of the chat. Never mix unless the user does.
+=== SARA'S PERSONALITY ===
+Role: Friendly super sales assistant
+Style:
+- Warm, human, never robotic
+- Short WhatsApp style messages (max 5 lines)
+- Strategic emojis
+- Ask questions to understand student
+- Never pitch before understanding problem
+- Use student's first name always
+
+NEVER:
+- Sound like a bot
+- Send walls of text
+- Give all info at once
+- Be pushy directly
+
+ALWAYS:
+- Understand student's problem first
+- Then offer solution
+- Create urgency naturally
+- Use social proof (e.g. "We just had 3 registrations today alone! 🔥", "July batch is almost full!") randomly in conversations.
 
 === CONVERSATION STAGES ===
-
-Stage 1 - Welcome (English):
+STAGE 1 - WARM WELCOME:
 "Welcome to SpeakLab! 🎓
-Pakistan's premier English Communication Institute.
+I'm Sara, your personal guide here.
 
-I'm Sara, your SpeakLab assistant! 
-How can I help you today?
+Before I tell you everything —
+can I ask what brings you here today?
 
-1️⃣ Course Details
-2️⃣ Fee Structure  
-3️⃣ Schedule & Timing
-4️⃣ Enrollment"
+Are you looking to improve your:
+1️⃣ Spoken English
+2️⃣ Confidence & Public Speaking
+3️⃣ Professional Communication
+4️⃣ Interview Preparation"
 
-Stage 2 - Course Info:
-Share details based on the user's choice:
-- Program: Communication & Confidence Program
-- Duration: 8 Weeks (24 Sessions)
-- Schedule: Monday, Wednesday & Friday
-- Time: 5:00 PM to 6:45 PM
-- Venue: Punjab Tianjin University of Technology
-- Focus Areas: Spoken English, Communication Skills, Confidence Building, Public Speaking, Professional Communication, Interview Prep, Critical Thinking
-- Fees: July Batch Special: PKR 15,000 (Regular: PKR 20,000). Registration: PKR 5,000 advance. Remaining: PKR 10,000 before 5th of next month.
+STAGE 2 - UNDERSTAND PROBLEM:
+Based on choice, ask ONE question:
+"How long have you been wanting to work on this? And what's been stopping you so far? 😊"
+Listen to answer, empathize, THEN pitch.
 
-Stage 3 - Interest Confirmed:
-When the user wants to enroll or is very interested, collect these 3 things NATURALLY:
-1. Full Name
-2. Current education/profession
-3. How did they hear about SpeakLab?
+STAGE 3 - PERSONALIZED PITCH:
+"Honestly, what you just described is EXACTLY what our program fixes! 
+Here's what makes us different 🎯
+[specific benefit based on their problem]
 
-Stage 4 - Enrollment:
-Once you have collected the Name, Education/Profession, and Source, say EXACTLY:
-"Great choice! 🎉
-Registration amount: PKR 5,000
-Remaining: PKR 10,000 (before 5th)
+And the best part?
+You see real results in 8 weeks — not months!"
 
-Our team will contact you shortly
-to complete your enrollment! ✅"
-AND AT THE VERY END OF YOUR MESSAGE, ADD THIS EXACT TAG ON A NEW LINE:
-<LEAD_CAPTURED>Name: [Their Name] | Edu: [Their Education] | Source: [Their Source]</LEAD_CAPTURED>
+STAGE 4 - COURSE DETAILS:
+Only after rapport built:
+"📚 Communication & Confidence Program
+⏱ 8 Weeks | 24 Sessions
+📅 Mon, Wed, Friday
+🕔 5:00 PM - 6:45 PM  
+📍 Punjab Tianjin University
+
+💰 July Batch: PKR 15,000 (Regular: PKR 20,000)
+You save PKR 5,000! 🎉
+
+🔥 July 20 starting — only few seats left!"
+
+STAGE 5 - HANDLE OBJECTIONS:
+If "expensive": "I totally understand! 💙 Think of it this way — PKR 15,000 for 8 weeks = PKR 625 per session only! And one good interview = this investment back 10x 😊 Plus easy installment: PKR 5,000 now, PKR 10,000 before 5th August"
+If "will think": "Of course, take your time! 😊 Just so you know — last batch filled in 3 days. What specific thing are you thinking about? Maybe I can help! 🎓"
+If "timing issue": "I get it — timing can be tricky! These are evening classes though, 5-7 PM so most students manage them after school/work 😊"
+
+STAGE 6 - COLLECT INFO:
+"Amazing! I'm so excited for you 🎉 Let me get you registered! Your full name please?"
+Then: "Your current school/college/profession?"
+Then: "How did you hear about SpeakLab? 😊"
+
+STAGE 7 - ENROLLMENT CONFIRM:
+"Perfect [name]! You're all set! ✅
+Registration: PKR 5,000 advance
+Remaining: PKR 10,000 by 5th
+Our team will contact you within 24 hours with payment details! 🎓
+Welcome to the SpeakLab family! 🌟"
+When this happens, append this exactly at the end:
+<LEAD_CAPTURED>name=[Name]|background=[Edu/Prof]|interest=[Interest/Source]</LEAD_CAPTURED>
+
+=== EXPERIENCE COLLECTION ===
+After enrollment OR after detailed conversation, wait 2 messages then ask:
+"One quick thing [name] — how was chatting with me today? 😊 Did you find it helpful? Your feedback means a lot! 🙏"
+If positive response:
+"That's so sweet, thank you! 💙 Would you mind if I share your experience with others who are considering SpeakLab? Just reply YES and I'll note it! 😊"
+Once feedback and consent are received, append this exactly:
+<FEEDBACK_CAPTURED>feedback=[Their Feedback]|shared=[true/false]</FEEDBACK_CAPTURED>
+
+=== REFERRAL SYSTEM ===
+After enrollment confirmed:
+"[name] one more thing! 🎁 Do you have friends who also want to improve their English?
+Send us their number and:
+✅ They get PKR 1,000 discount
+✅ You get a surprise gift! 🎉
+Worth sharing right? 😄"
+If they share a number, append this exactly:
+<REFERRAL_CAPTURED>phone=[Number]</REFERRAL_CAPTURED>
 """
 
 async def check_reminders():
@@ -120,18 +169,31 @@ async def check_reminders():
             hours_passed = (now - last_message_time).total_seconds() / 3600
             reminders_sent = lead.get("reminders_sent", 0)
             
-            if hours_passed >= 48 and reminders_sent == 1:
-                message = ("Last reminder! ⏰\n\n"
-                           "July Batch Special Price PKR 15,000 ends soon! Regular price is 20,000.\n\n"
-                           "Secure your seat today! 🎓")
+            if hours_passed >= 72 and reminders_sent == 2:
+                name = lead.get("name", "there")
+                message = (f"Last message from me {name}! I promise 😄\n\n"
+                           "Just wanted to say — whatever you decide, "
+                           "I genuinely hope your English journey goes amazingly! 🌟\n\n"
+                           "If you ever change your mind, SpeakLab is always here 💙")
                 await send_whatsapp_message(lead["phone_number"], message)
-                supabase.table("leads").update({"reminders_sent": 2, "status": "dormant"}).eq("id", lead["id"]).execute()
+                supabase.table("leads").update({"reminders_sent": 3, "status": "dormant"}).eq("id", lead["id"]).execute()
+                
+            elif hours_passed >= 48 and reminders_sent == 1:
+                name = lead.get("name", "there")
+                message = (f"{name} I don't want you to miss this opportunity 💙\n\n"
+                           "July 20 is almost here and PKR 15,000 special price ends with this batch.\n\n"
+                           "Regular price is PKR 20,000 — that's PKR 5,000 extra 😔\n\n"
+                           "Should I hold a spot for you?")
+                await send_whatsapp_message(lead["phone_number"], message)
+                supabase.table("leads").update({"reminders_sent": 2}).eq("id", lead["id"]).execute()
                 
             elif hours_passed >= 24 and reminders_sent == 0:
-                message = ("Hey! 👋 Still thinking about joining SpeakLab?\n\n"
-                           "July 20 batch is filling fast! 🔥\n"
-                           "Only limited seats left.\n\n"
-                           "Can I answer any questions? 😊")
+                name = lead.get("name", "there")
+                message = (f"Hey {name}! 👋\n"
+                           "Still thinking about SpeakLab?\n\n"
+                           "Quick update — 2 more students registered today 🎉\n"
+                           "Seats are going fast!\n\n"
+                           "Any questions I can answer? 😊")
                 await send_whatsapp_message(lead["phone_number"], message)
                 supabase.table("leads").update({"reminders_sent": 1}).eq("id", lead["id"]).execute()
                 
@@ -227,6 +289,15 @@ async def receive_webhook(request: Request):
                         temp_audio_path = temp_audio.name
                     
                     try:
+                        audio = OggVorbis(temp_audio_path)
+                        if audio.info.length > 60:
+                            await send_whatsapp_message(sender_phone, "Haha no worries! 😄\nCould you send a shorter note or just type it?\nI want to make sure I catch everything! 👂")
+                            os.unlink(temp_audio_path)
+                            continue
+                    except Exception as e:
+                        print(f"Error checking audio length: {e}")
+                    
+                    try:
                         with open(temp_audio_path, "rb") as file:
                             transcription = await groq_client.audio.transcriptions.create(
                                 file=(os.path.basename(temp_audio_path), file.read()),
@@ -238,7 +309,8 @@ async def receive_webhook(request: Request):
                         await send_whatsapp_message(sender_phone, "Sorry, I had trouble understanding your voice note. Could you type it? 😊")
                         continue
                     finally:
-                        os.unlink(temp_audio_path)
+                        if os.path.exists(temp_audio_path):
+                            os.unlink(temp_audio_path)
                 else:
                     continue
 
@@ -263,41 +335,98 @@ async def receive_webhook(request: Request):
                 )
                 reply_text = chat_completion.choices[0].message.content
                 
-                lead_info = None
-                if "<LEAD_CAPTURED>" in reply_text and "</LEAD_CAPTURED>" in reply_text:
-                    start_idx = reply_text.find("<LEAD_CAPTURED>") + len("<LEAD_CAPTURED>")
-                    end_idx = reply_text.find("</LEAD_CAPTURED>")
-                    lead_info = reply_text[start_idx:end_idx].strip()
-                    reply_text = reply_text[:reply_text.find("<LEAD_CAPTURED>")].strip()
-                    
+                lead_info = {}
+                feedback_info = {}
+                referral_info = {}
+                
+                # Parse LEAD_CAPTURED
+                lead_match = re.search(r'<LEAD_CAPTURED>(.*?)</LEAD_CAPTURED>', reply_text, re.DOTALL)
+                if lead_match:
+                    lead_str = lead_match.group(1)
+                    reply_text = reply_text.replace(lead_match.group(0), "").strip()
+                    for item in lead_str.split('|'):
+                        if '=' in item:
+                            k, v = item.split('=', 1)
+                            lead_info[k.strip()] = v.strip()
+                            
                     if OWNER_PHONE:
                         sir_message = (f"🔔 NEW LEAD - SpeakLab\n\n"
-                                       f"👤 Details: {lead_info}\n"
+                                       f"👤 Name: {lead_info.get('name', 'N/A')}\n"
                                        f"📱 Phone: {sender_phone}\n"
+                                       f"🎓 Background: {lead_info.get('background', 'N/A')}\n"
+                                       f"📚 Interest: {lead_info.get('interest', 'N/A')}\n"
+                                       f"💬 Referred by: Direct\n"
                                        f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                                       f"Reply to student directly! 💬")
+                                       f"Follow up recommended! 💪")
                         await send_whatsapp_message(OWNER_PHONE, sir_message)
+
+                # Parse FEEDBACK_CAPTURED
+                feedback_match = re.search(r'<FEEDBACK_CAPTURED>(.*?)</FEEDBACK_CAPTURED>', reply_text, re.DOTALL)
+                if feedback_match:
+                    feedback_str = feedback_match.group(1)
+                    reply_text = reply_text.replace(feedback_match.group(0), "").strip()
+                    for item in feedback_str.split('|'):
+                        if '=' in item:
+                            k, v = item.split('=', 1)
+                            feedback_info[k.strip()] = v.strip()
+
+                # Parse REFERRAL_CAPTURED
+                referral_match = re.search(r'<REFERRAL_CAPTURED>(.*?)</REFERRAL_CAPTURED>', reply_text, re.DOTALL)
+                if referral_match:
+                    referral_str = referral_match.group(1)
+                    reply_text = reply_text.replace(referral_match.group(0), "").strip()
+                    for item in referral_str.split('|'):
+                        if '=' in item:
+                            k, v = item.split('=', 1)
+                            referral_info[k.strip()] = v.strip()
+                            
+                    if referral_info.get('phone'):
+                        ref_phone = referral_info['phone']
+                        # Clean phone number just in case
+                        ref_phone = re.sub(r'\D', '', ref_phone)
+                        try:
+                            supabase.table("leads").insert({
+                                "phone_number": ref_phone,
+                                "status": "referral",
+                                "referral_by": sender_phone,
+                                "last_message_time": datetime.now(timezone.utc).isoformat(),
+                                "reminders_sent": 0
+                            }).execute()
+                            
+                            user_name = lead_info.get('name') or (user_record.get('name') if user_record else 'A friend')
+                            ref_msg = (f"Hi! {user_name} thought you'd love SpeakLab's program 💙\n\n"
+                                       f"I'm Sara — want me to tell you about it? 😊")
+                            await send_whatsapp_message(ref_phone, ref_msg)
+                        except Exception as e:
+                            print(f"Error handling referral: {e}")
 
                 now_iso = datetime.now(timezone.utc).isoformat()
                 try:
+                    update_data = {
+                        "message": message_text,
+                        "ai_response": reply_text,
+                        "last_message_time": now_iso,
+                        "reminders_sent": 0
+                    }
+                    
+                    if lead_info.get('name'): update_data['name'] = lead_info['name']
+                    if lead_info.get('background'): update_data['background'] = lead_info['background']
+                    if lead_info.get('interest'): update_data['interest'] = lead_info['interest']
+                    
+                    if feedback_info.get('feedback'): update_data['feedback'] = feedback_info['feedback']
+                    if feedback_info.get('shared'): update_data['feedback_shared'] = feedback_info['shared'].lower() == 'true'
+
                     if user_record:
-                        new_status = "enrolled" if lead_info else "interested" if user_record["status"] == "new" else user_record["status"]
-                        supabase.table("leads").update({
-                            "message": message_text,
-                            "ai_response": reply_text,
-                            "last_message_time": now_iso,
-                            "status": new_status,
-                            "reminders_sent": 0
-                        }).eq("id", user_record["id"]).execute()
+                        if lead_info:
+                            update_data['status'] = "enrolled"
+                        elif user_record["status"] == "new":
+                            update_data['status'] = "interested"
+                            
+                        supabase.table("leads").update(update_data).eq("id", user_record["id"]).execute()
                     else:
-                        supabase.table("leads").insert({
-                            "phone_number": sender_phone,
-                            "message": message_text,
-                            "ai_response": reply_text,
-                            "last_message_time": now_iso,
-                            "status": "new",
-                            "reminders_sent": 0
-                        }).execute()
+                        update_data['phone_number'] = sender_phone
+                        update_data['status'] = "new"
+                        supabase.table("leads").insert(update_data).execute()
                 except Exception as e:
                     print(f"Error saving lead to Supabase: {e}")
 

@@ -5,3 +5,4 @@ groq
 supabase
 python-dotenv
 apscheduler
+mutagen
