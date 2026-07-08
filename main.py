@@ -266,6 +266,11 @@ async def receive_webhook(request: Request):
 
     try:
         entry = data.get("entry", [])[0]
+        # Validate WABA_ID if available
+        if WABA_ID and entry.get("id") != WABA_ID:
+            print("Webhook entry ID does not match WABA_ID")
+            return {"status": "error", "message": "Invalid WABA ID"}
+            
         changes = entry.get("changes", [])[0]
         value = changes.get("value", {})
         
