@@ -337,7 +337,7 @@ async def receive_webhook(request: Request):
                 
                 chat_completion = await groq_client.chat.completions.create(
                     messages=context_messages,
-                    model="llama3-8b-8192",
+                    model="llama-3.1-8b-instant",
                 )
                 reply_text = chat_completion.choices[0].message.content
                 
