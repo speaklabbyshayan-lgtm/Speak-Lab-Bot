@@ -228,6 +228,8 @@ async def send_whatsapp_message(to_phone: str, text: str):
             "text": {"body": text}
         }
         response = await client.post(url, headers=headers, json=payload)
+        if response.status_code != 200:
+            print(f"Failed to send WhatsApp message: {response.text}")
         return response
 
 async def download_whatsapp_media(media_id: str):
