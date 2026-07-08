@@ -17,8 +17,9 @@ from mutagen.oggvorbis import OggVorbis
 # Load environment variables
 load_dotenv()
 
-WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
+WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN")
+WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
+WABA_ID = os.environ.get("WABA_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "speaklab_verify_token")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -215,9 +216,9 @@ class BroadcastRequest(BaseModel):
 
 async def send_whatsapp_message(to_phone: str, text: str):
     async with httpx.AsyncClient() as client:
-        url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+        url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
         headers = {
-            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
             "Content-Type": "application/json"
         }
         payload = {
@@ -232,7 +233,7 @@ async def send_whatsapp_message(to_phone: str, text: str):
 async def download_whatsapp_media(media_id: str):
     async with httpx.AsyncClient() as client:
         url = f"https://graph.facebook.com/v19.0/{media_id}"
-        headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+        headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
         res = await client.get(url, headers=headers)
         if res.status_code != 200:
             return None
