@@ -6,3 +6,4 @@ supabase
 python-dotenv
 apscheduler
 mutagen
+google-generativeai

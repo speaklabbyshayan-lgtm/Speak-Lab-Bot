@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 from groq import AsyncGroq
+import google.generativeai as genai
 from supabase import create_client, Client
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -22,6 +23,7 @@ WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
 WABA_ID = os.environ.get("WABA_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "speaklab_verify_token")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 OWNER_PHONE = os.environ.get("OWNER_PHONE")
@@ -35,6 +37,12 @@ try:
     groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 except Exception as e:
     print(f"Warning: Groq client initialization failed: {e}")
+
+try:
+    if GEMINI_API_KEY:
+        genai.configure(api_key=GEMINI_API_KEY)
+except Exception as e:
+    print(f"Warning: Gemini client initialization failed: {e}")
 
 scheduler = AsyncIOScheduler()
 
@@ -147,6 +155,47 @@ Worth sharing right? 😄"
 If they share a number, append this exactly:
 <REFERRAL_CAPTURED>phone=[Number]</REFERRAL_CAPTURED>
 """
+
+async def generate_ai_response(context_messages):
+    # Try Gemini First
+    try:
+        if GEMINI_API_KEY:
+            gemini_model = genai.GenerativeModel(
+                model_name='gemini-1.5-flash',
+                system_instruction=SYSTEM_PROMPT
+            )
+            
+            gemini_history = []
+            for msg in context_messages:
+                if msg["role"] == "system":
+                    continue
+                elif msg["role"] == "user":
+                    gemini_history.append({"role": "user", "parts": [msg["content"]]})
+                elif msg["role"] == "assistant":
+                    gemini_history.append({"role": "model", "parts": [msg["content"]]})
+            
+            # The last message is the current user message, which we pass to generate_content
+            current_message = gemini_history.pop()
+            
+            chat = gemini_model.start_chat(history=gemini_history)
+            response = await chat.send_message_async(current_message["parts"][0])
+            
+            print("Successfully replied via Gemini")
+            return response.text
+    except Exception as e:
+        print(f"Gemini API failed: {e}. Falling back to Groq...")
+
+    # Fallback to Groq
+    try:
+        chat_completion = await groq_client.chat.completions.create(
+            messages=context_messages,
+            model="llama-3.1-8b-instant",
+        )
+        print("Successfully replied via Groq")
+        return chat_completion.choices[0].message.content
+    except Exception as e:
+        print(f"Groq API fallback also failed: {e}")
+        return "I'm having a bit of trouble right now. Please give me a moment and try again! 😊"
 
 async def check_reminders():
     print("Checking for dormant leads to send reminders...")
@@ -341,11 +390,7 @@ async def receive_webhook(request: Request):
                 
                 context_messages.append({"role": "user", "content": message_text})
                 
-                chat_completion = await groq_client.chat.completions.create(
-                    messages=context_messages,
-                    model="llama-3.1-8b-instant",
-                )
-                reply_text = chat_completion.choices[0].message.content
+                reply_text = await generate_ai_response(context_messages)
                 
                 lead_info = {}
                 feedback_info = {}
