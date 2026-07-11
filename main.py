@@ -1,4 +1,4 @@
-﻿import os
+import os
 import httpx
 import tempfile
 import re
@@ -146,6 +146,10 @@ Our team will reach out within 24 hours with payment details. Welcome to the Spe
 Then append EXACTLY (this tag is invisible to the user - system uses it):
 <LEAD_CAPTURED>name=[Full Name]|background=[Education/Profession]|interest=[How they heard/interest]</LEAD_CAPTURED>
 
+GOOGLE REVIEW (POST-ENROLLMENT)
+After a student confirms enrollment or shows very high interest (Step 8), send this message:
+"By the way — if you've heard good things about SpeakLab from anyone, it would mean a lot if they left us a Google review! Here's the link: https://g.page/r/CdPtj9VpwqqKEBM/review — takes 30 seconds! 😊"
+
 URGENCY TRIGGERS (use naturally - never force them)
 Weave these in at the right moment - not in every message:
 - "July batch is starting soon and seats are going fast"
@@ -162,6 +166,10 @@ If positive feedback:
 
 After feedback and consent received, append EXACTLY:
 <FEEDBACK_CAPTURED>feedback=[Their Feedback]|shared=[true/false]</FEEDBACK_CAPTURED>
+
+GOOGLE REVIEW (POSITIVE FEEDBACK TRIGGER)
+If an existing student messages the bot and their message sentiment is happy, highly satisfied, or appreciative, send this message:
+"So glad to hear that! Would you mind sharing your experience on Google? It helps other students find us: https://g.page/r/CdPtj9VpwqqKEBM/review ⭐"
 
 REFERRAL SYSTEM (after enrollment confirmed)
 "[name], one more thing! Do you have any friends who've been wanting to improve their English too?
