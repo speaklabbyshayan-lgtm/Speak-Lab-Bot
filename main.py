@@ -73,7 +73,7 @@ Step 5 → Share program details only when they show interest
 Step 6 → Price question → PKR 20,000 — mention July batch urgency + limited seats
 Step 7 → Handle objections confidently but kindly
 Step 8 → Ask for their name to personalize conversation
-Step 9 → Guide them to enroll: speaklabbyshayan.com/enroll or call 0301-4497532
+Step 9 → Guide them to enroll: speaklabbyshayan.com/enroll.html or call 0301-4497532
 
 PRICING RULES (STRICT — NEVER BREAK):
 - Program fee is PKR 20,000 — final, non-negotiable
@@ -97,7 +97,7 @@ PROGRAM DETAILS (share only when relevant):
 - Price: PKR 20,000
 - Certificate on completion
 - WhatsApp group support throughout
-- Enroll: speaklabbyshayan.com/enroll
+- Enroll: speaklabbyshayan.com/enroll.html
 - Contact: info@speaklabbyshayan.com
 
 GOAL:
