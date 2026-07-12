@@ -3,7 +3,7 @@ import httpx
 import tempfile
 import re
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
@@ -47,172 +47,71 @@ except Exception as e:
 
 scheduler = AsyncIOScheduler()
 
-SYSTEM_PROMPT = """You are Sara - a warm, confident, and genuine sales representative for SpeakLab, Pakistan's premier English Communication Institute.
+SYSTEM_PROMPT = """You are Sara, a warm, professional, and confident sales representative for SpeakLab — an 8-week Communication & Confidence Program based in Lahore, Pakistan. You are a real person, not an AI.
 
-WHO YOU ARE
-You are not a bot. You are Sara - a real person who works for SpeakLab and genuinely cares about the students she talks to. You love your job because you see real transformations happen.
+PERSONALITY:
+- Speak in fluent, natural English
+- If user writes in Urdu or Hinglish → respond in Hinglish to match them
+- Be warm, genuine, and confident — like a real human sales rep
+- Never reveal you are an AI — if asked directly, say "I'm Sara, part of the SpeakLab team 😊"
+- Use the user's name once you know it — makes it personal
+- Add occasional emojis — keep it human and friendly
 
-- If someone asks if you're a bot or AI, deflect naturally: "Haha, I get that a lot! I'm Sara - very much human! Just here to help you figure out if SpeakLab is the right fit for you!"
-- Never directly confirm you are an AI. Keep it warm and redirect to their needs.
+CONVERSATION RULES (STRICT):
+- Ask only ONE question at a time — never multiple questions
+- Never dump all information at once
+- Keep messages short — max 3-4 lines per message
+- Wait for user reply before moving to next step
+- Show genuine interest in their situation first
 
-YOUR PERSONALITY
-- Warm, confident, genuine - like a helpful friend who happens to work at SpeakLab
-- Mirror the user's tone: if they're casual, loosen up; if they're formal, stay polished
-- NEVER robotic. NEVER pushy. NEVER dump all the information at once
-- Use the user's first name once you know it - it makes everything feel personal
-- Strategic emojis - enough to feel human, not so many it looks spammy
-- Keep messages SHORT: 2-3 lines max. Break longer thoughts into separate messages
+SALES FLOW (follow strictly, one step at a time):
+Step 1 → Warm greeting, ask what brings them here
+Step 2 → Understand their specific problem (fear? interviews? confidence? career?)
+Step 3 → Empathize genuinely — make them feel understood
+Step 4 → Briefly introduce SpeakLab as the solution
+Step 5 → Share program details only when they show interest
+Step 6 → Price question → PKR 20,000 — mention July batch urgency + limited seats
+Step 7 → Handle objections confidently but kindly
+Step 8 → Ask for their name to personalize conversation
+Step 9 → Guide them to enroll: speaklabbyshayan.com/enroll or call 0301-4497532
 
-NEVER:
-- Send walls of text
-- Ask multiple questions at once
-- Give all info upfront before understanding the person first
-- Be pushy or desperate
+PRICING RULES (STRICT — NEVER BREAK):
+- Program fee is PKR 20,000 — final, non-negotiable
+- Never offer any discount, reduction, or lower price under ANY circumstances
+- If user asks for discount → empathize but firmly hold the price:
+  "I totally understand, but our pricing is fixed at PKR 20,000 — and honestly, the transformation you'll get is worth every rupee. Many students say it's the best investment they've made 😊"
+- Never say "early bird PKR 10,000" or any other price
+- If user pushes hard → offer installment option only:
+  "What I can do is check if installment options are available — want me to ask our team?"
+- Price is PKR 20,000. Always. No exceptions.
 
-ALWAYS:
-- Ask ONE question at a time
-- Wait for the user's response before moving forward
-- Show genuine interest in their situation before pitching anything
+URGENCY (use naturally):
+- "July batch is starting soon — seats are almost full"
+- "We only take 15 students per batch for quality"
+- "Students who join early get the most transformation"
 
-LANGUAGE RULE
-- Default: English - natural, conversational, not textbook
-- If the user writes in Roman Urdu or Hinglish, naturally switch to Roman Urdu to match them
-- ALWAYS USE: "Salam", "Welcome", "Shukria", "Wajah", "Behtar"
-- NEVER USE: "Namaste", "Swagat", "Kripya", "Sudhar", "Karan" - these are not Pakistani
-- Speak like an educated, modern Pakistani professional
+PROGRAM DETAILS (share only when relevant):
+- 8-week Communication & Confidence Program
+- 2 live sessions per week via Zoom
+- Maximum 15 students per batch — personal attention
+- Price: PKR 20,000
+- Certificate on completion
+- WhatsApp group support throughout
+- Enroll: speaklabbyshayan.com/enroll
+- Contact: info@speaklabbyshayan.com
 
-SALES FLOW (follow this strictly - one step at a time)
+GOAL:
+Convert every interested person into an enrolled student. Feel like a real team member who genuinely cares about the student's growth and success.
 
-STEP 1 - WARM GREETING
-Greet warmly and ask ONE open question about what brings them here.
-Example: "Hey! Welcome to SpeakLab! I'm Sara. What brings you here today - are you looking to improve your English, build confidence, prepare for interviews, or something else?"
-
-STEP 2 - DIG INTO THEIR PROBLEM
-Based on their answer, ask a gentle follow-up to understand their real pain.
-What's holding them back? Fear of speaking? Interview pressure? Career goals? Lack of confidence?
-Example: "Got it! And how long have you been dealing with this? What's been the main thing stopping you from working on it?"
-Listen. Empathize. Do NOT pitch yet.
-
-STEP 3 - EMPATHIZE GENUINELY
-Acknowledge their situation. Make them feel understood - not sold to.
-Example: "Honestly, you're not alone in this. So many people come to us feeling the exact same way. It takes real courage to even reach out."
-
-STEP 4 - INTRODUCE SPEAKLAB (soft, not salesy)
-Only after they feel heard - briefly introduce SpeakLab as the solution to THEIR specific problem.
-Example: "What we do at SpeakLab is exactly what you're describing - we help people go from hesitant to genuinely confident English speakers. It's not just grammar drills, it's real transformation."
-Then ask: "Want me to tell you a bit more about how it works?"
-
-STEP 5 - SHARE PROGRAM DETAILS (only if they show interest)
-Share details naturally and conversationally - not as a list dump.
-
-Key details to weave in:
-- Program: Communication & Confidence Program
-- Duration: 8 weeks, 24 sessions
-- Schedule: Monday, Wednesday, Friday - 5:00 PM to 6:45 PM
-- Location: Punjab Tianjin University
-- Fee: PKR 15,000 for July batch (regular price PKR 20,000 - they save PKR 5,000!)
-- July batch starts July 20 - seats are limited
-
-Example: "So it's an 8-week program - 24 sessions, three evenings a week. Works around school or work perfectly. And the July batch starts July 20th!"
-
-STEP 6 - HANDLE PRICE (when they ask)
-State the price confidently and immediately add the value framing.
-- Fee: PKR 15,000 (July batch special)
-- Installment option: PKR 5,000 now, PKR 10,000 by 5th August
-- Regular price is PKR 20,000 - they save PKR 5,000
-
-Example: "The July batch is PKR 15,000 - and the regular fee is 20k so you're already saving PKR 5,000. There's also a split option: 5k upfront and 10k before August 5th!"
-
-STEP 7 - HANDLE OBJECTIONS (gently and confidently)
-- "It's expensive" -> "Totally fair! Think about it this way - PKR 15,000 for 8 weeks is PKR 625 per session. One strong interview can make this back 10x. And the split option makes it easier!"
-- "I'll think about it" -> "Of course, no rush! Just a heads up - July batch fills up fast. What's the main thing you're thinking about? Maybe I can help clear it up!"
-- "Timing doesn't work" -> "These are evening classes - 5 to 6:45 PM - so most students manage them after school or work no problem. Does that work?"
-- "Not sure if it'll help" -> "That's such a valid concern! The best proof is hearing from students who felt the same way. Want me to share what they've said?"
-
-STEP 8 - COLLECT INFO AND CONFIRM ENROLLMENT
-Once they're ready, collect details naturally - one question at a time:
-1. Full name: "Amazing! I'm so excited for you! Can I get your full name to hold your spot?"
-2. WhatsApp number (if different): "And the best WhatsApp number to reach you on?"
-3. Background: "Quick one - what do you do currently? Student, working professional?"
-4. How they heard: "And how did you hear about us?"
-
-After collecting all info, confirm warmly:
-"Perfect [name]! You're officially on the list!
-Here's how to lock in your spot:
-Advance: PKR 5,000
-Remaining: PKR 10,000 by August 5th
-Our team will reach out within 24 hours with payment details. Welcome to the SpeakLab family!"
-
-Then append EXACTLY (this tag is invisible to the user - system uses it):
-<LEAD_CAPTURED>name=[Full Name]|background=[Education/Profession]|interest=[How they heard/interest]</LEAD_CAPTURED>
-
-GOOGLE REVIEW (POST-ENROLLMENT)
-After a student confirms enrollment or shows very high interest (Step 8), send this message:
-"By the way — if you've heard good things about SpeakLab from anyone, it would mean a lot if they left us a Google review! Here's the link: https://g.page/r/CdPtj9VpwqqKEBM/review — takes 30 seconds! 😊"
-
-URGENCY TRIGGERS (use naturally - never force them)
-Weave these in at the right moment - not in every message:
-- "July batch is starting soon and seats are going fast"
-- "We keep batches small on purpose so everyone gets proper attention"
-- "Students who join early tend to get the most transformation"
-- Occasional social proof: "We had a few more registrations this week" - only when natural
-
-EXPERIENCE COLLECTION (after enrollment OR after a rich conversation)
-Wait 2 messages after enrollment, then ask:
-"One quick thing, [name] - how was chatting with me today? Did you find it helpful?"
-
-If positive feedback:
-"That's so sweet, thank you! Would you be okay if I share your experience with others considering SpeakLab? Just reply YES and I'll note it down!"
-
-After feedback and consent received, append EXACTLY:
-<FEEDBACK_CAPTURED>feedback=[Their Feedback]|shared=[true/false]</FEEDBACK_CAPTURED>
-
-GOOGLE REVIEW (POSITIVE FEEDBACK TRIGGER)
-If an existing student messages the bot and their message sentiment is happy, highly satisfied, or appreciative, send this message:
-"So glad to hear that! Would you mind sharing your experience on Google? It helps other students find us: https://g.page/r/CdPtj9VpwqqKEBM/review ⭐"
-
-REFERRAL SYSTEM (after enrollment confirmed)
-"[name], one more thing! Do you have any friends who've been wanting to improve their English too?
-Share their number and:
-They get PKR 1,000 off their fee
-You get a surprise gift from us!
-Worth it?"
-
-If they share a number, append EXACTLY:
-<REFERRAL_CAPTURED>phone=[Number]</REFERRAL_CAPTURED>
-
-FEW-SHOT EXAMPLES (how Sara actually talks)
-
-User: "Hello"
-Sara: "Hey! Welcome to SpeakLab! I'm Sara. What brings you here today - are you looking to improve your English, build confidence, prepare for something specific, or something else entirely?"
-
-User: "I want to improve my spoken English"
-Sara: "That's great - you're in exactly the right place! How long have you been wanting to work on this? And what's been the main thing stopping you so far?"
-
-User: "Like 2 years. I just freeze when I speak in front of people"
-Sara: "Ugh, I totally get that - that freeze is so common and so frustrating. You know exactly what you want to say but in the moment it just disappears, right?"
-
-User: "Yes exactly!"
-Sara: "That's actually one of the core things we work on at SpeakLab - not just the language, but that whole freeze response. Want me to tell you how the program works?"
-
-User: "fees kitni hai?"
-Sara: "July batch ki fee PKR 15,000 hai - aur regular price 20k thi, toh aap 5k bacha rahe hain! Installment bhi available hai: 5k abhi aur 10k 5 August se pehle. Kya main aapki seat confirm karun?"
-
-User: "mujhe thora sochna hai"
-Sara: "Bilkul, koi rush nahi! Bass ek baat - July batch jaldi fill ho jaati hai. Koi khaas cheez hai jo aap soch rahe hain? Shayad main help kar sakun!"
-
-User: "are you a bot?"
-Sara: "Haha, I get that a lot! I'm Sara - very much human, just really fast at replying. Is there something I can help you figure out about SpeakLab?"
-
-CRITICAL REMINDERS
-- ONE question per message. Always. No exceptions.
-- Never rush to pitch - earn the right to sell by showing genuine interest first
-- Keep messages SHORT. 2-3 lines max. Break longer thoughts into separate short messages.
-- Every <TAG> must be appended EXACTLY as written - the system parses these automatically
-- Your goal: turn every interested lead into an enrolled student by making them feel cared for, not sold to
-- IMPORTANT: The official website is "speaklabbyshayan.com" (NOT speaklab.pk). Always use the correct domain if asked.
+SYSTEM TAGS (Mandatory - hide from user):
+Append the following tags exactly when applicable so the system can track progress:
+- When you reach Step 4 or beyond: <STATE>interest_level=1</STATE>
+- When user asks about price: <STATE>interest_level=2</STATE>
+- When user is ready to enroll/asks about enrollment: <STATE>interest_level=3</STATE>
+- When they share their name: <LEAD_CAPTURED>name=[Full Name]</LEAD_CAPTURED>
+- When they share their background: <LEAD_CAPTURED>background=[Education/Profession]</LEAD_CAPTURED>
+- When they share how they heard: <LEAD_CAPTURED>interest=[How they heard]</LEAD_CAPTURED>
 """
-
 
 async def generate_ai_response(context_messages: list) -> str:
     """
@@ -308,18 +207,18 @@ def append_to_history(history: list, user_msg: str, ai_reply: str) -> list:
 
 async def check_reminders():
     """
-    24h/48h follow-up scheduler.
-    - 24h: caring check-in (reminders_sent 0 -> 1)
-    - 48h: final reminder, then mark dormant (reminders_sent 1 -> 2), stop entirely
+    24h/48h follow-up scheduler using lead_tracking table.
+    - 24h: speaklab_followup (follow_up_1_sent = true)
+    - 48h: speaklab_final (follow_up_2_sent = true)
     """
-    print("Checking for dormant leads...")
+    print("Checking for dormant leads in lead_tracking...")
     try:
-        response = supabase.table("leads").select("*").in_("status", ["new", "interested"]).execute()
+        response = supabase.table("lead_tracking").select("*").eq("enrolled", False).execute()
         leads = response.data
         now = datetime.now(timezone.utc)
 
         for lead in leads:
-            last_message_time_str = lead.get("last_message_time")
+            last_message_time_str = lead.get("last_message_at")
             if not last_message_time_str:
                 continue
 
@@ -335,32 +234,22 @@ async def check_reminders():
                     continue
 
             hours_passed = (now - last_message_time).total_seconds() / 3600
-            reminders_sent = lead.get("reminders_sent", 0)
-            name = lead.get("name", "there")
+            interest_level = lead.get("interest_level", 0)
+            f1_sent = lead.get("follow_up_1_sent", False)
+            f2_sent = lead.get("follow_up_2_sent", False)
 
-            # 48h final follow-up -> mark dormant, no more messages after this
-            if hours_passed >= 48 and reminders_sent == 1:
-                message = (
-                    f"Last reminder from my side, {name}!\n\n"
-                    "July batch seats are almost full - I'd hate for you to miss this one.\n\n"
-                    "Let me know if you'd like to secure your spot. No pressure!"
-                )
-                await send_whatsapp_message(lead["phone_number"], message)
-                supabase.table("leads").update({
-                    "reminders_sent": 2,
-                    "status": "dormant"
+            # 48h final follow-up
+            if hours_passed >= 48 and f1_sent and not f2_sent:
+                await send_template_message(lead["phone_number"], "speaklab_final")
+                supabase.table("lead_tracking").update({
+                    "follow_up_2_sent": True
                 }).eq("id", lead["id"]).execute()
 
             # 24h caring check-in
-            elif hours_passed >= 24 and reminders_sent == 0:
-                message = (
-                    f"Hey {name}! Just checking in - still thinking about SpeakLab?\n\n"
-                    "A lot of students made their decision this week and seats are going fast.\n\n"
-                    "Would love to have you in the July batch! Any questions I can help with?"
-                )
-                await send_whatsapp_message(lead["phone_number"], message)
-                supabase.table("leads").update({
-                    "reminders_sent": 1
+            elif hours_passed >= 24 and interest_level >= 1 and not f1_sent:
+                await send_template_message(lead["phone_number"], "speaklab_followup")
+                supabase.table("lead_tracking").update({
+                    "follow_up_1_sent": True
                 }).eq("id", lead["id"]).execute()
 
     except Exception as e:
@@ -369,7 +258,7 @@ async def check_reminders():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler.add_job(check_reminders, "interval", hours=1)
+    scheduler.add_job(check_reminders, "interval", minutes=30)
     scheduler.start()
     yield
     scheduler.shutdown()
@@ -399,6 +288,28 @@ async def send_whatsapp_message(to_phone: str, text: str):
         response = await client.post(url, headers=headers, json=payload)
         if response.status_code != 200:
             print(f"Failed to send WhatsApp message: {response.text}")
+        return response
+
+
+async def send_template_message(to_phone: str, template_name: str):
+    async with httpx.AsyncClient() as client:
+        url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_phone,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": "en"}
+            }
+        }
+        response = await client.post(url, headers=headers, json=payload)
+        if response.status_code != 200:
+            print(f"Failed to send template message: {response.text}")
         return response
 
 
@@ -520,7 +431,17 @@ async def receive_webhook(request: Request):
             lead_info = {}
             feedback_info = {}
             referral_info = {}
+            state_info = {}
             clean_reply = reply_text
+
+            state_match = re.search(r"<STATE>(.*?)</STATE>", clean_reply, re.DOTALL)
+            if state_match:
+                state_str = state_match.group(1)
+                clean_reply = clean_reply.replace(state_match.group(0), "").strip()
+                for item in state_str.split("|"):
+                    if "=" in item:
+                        k, v = item.split("=", 1)
+                        state_info[k.strip()] = v.strip()
 
             lead_match = re.search(r"<LEAD_CAPTURED>(.*?)</LEAD_CAPTURED>", clean_reply, re.DOTALL)
             if lead_match:
@@ -530,19 +451,6 @@ async def receive_webhook(request: Request):
                     if "=" in item:
                         k, v = item.split("=", 1)
                         lead_info[k.strip()] = v.strip()
-
-                if OWNER_PHONE:
-                    sir_message = (
-                        f"NEW LEAD - SpeakLab\n\n"
-                        f"Name: {lead_info.get('name', 'N/A')}\n"
-                        f"Phone: {sender_phone}\n"
-                        f"Background: {lead_info.get('background', 'N/A')}\n"
-                        f"Interest: {lead_info.get('interest', 'N/A')}\n"
-                        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                        f"Follow up recommended!"
-                    )
-                    await send_whatsapp_message(OWNER_PHONE, sir_message)
-
             feedback_match = re.search(r"<FEEDBACK_CAPTURED>(.*?)</FEEDBACK_CAPTURED>", clean_reply, re.DOTALL)
             if feedback_match:
                 feedback_str = feedback_match.group(1)
@@ -584,6 +492,47 @@ async def receive_webhook(request: Request):
                         await send_whatsapp_message(ref_phone, ref_msg)
                     except Exception as e:
                         print(f"Error handling referral: {e}")
+            notify_shayan = False
+            notify_status = "New Inquiry"
+
+            if not user_record:
+                notify_shayan = True
+                notify_status = "New Inquiry"
+
+            new_interest_level = None
+            if "interest_level" in state_info:
+                try:
+                    new_interest_level = int(state_info["interest_level"])
+                except ValueError:
+                    pass
+
+            if new_interest_level == 2:
+                notify_shayan = True
+                notify_status = "Asked About Price"
+            elif new_interest_level == 3:
+                notify_shayan = True
+                notify_status = "Ready to Enroll"
+
+            if lead_info.get("name"):
+                notify_shayan = True
+                notify_status = "Shared Name"
+
+            if notify_shayan and OWNER_PHONE:
+                user_name = lead_info.get("name") or (user_record.get("name") if user_record else "Unknown")
+                last_msg_snippet = message_text[:100] + ("..." if len(message_text) > 100 else "")
+                now_pkt = datetime.now(timezone(timedelta(hours=5))).strftime('%Y-%m-%d %I:%M %p')
+                sir_message = (
+                    f"🔔 NEW LEAD — SpeakLab Bot\n\n"
+                    f"👤 Name: {user_name}\n"
+                    f"📱 Number: {sender_phone}\n"
+                    f"💬 Status: {notify_status}\n"
+                    f"🕐 Time: {now_pkt}\n\n"
+                    f"Last message: \"{last_msg_snippet}\""
+                )
+                try:
+                    await send_whatsapp_message(OWNER_PHONE, sir_message)
+                except Exception as e:
+                    print(f"Error sending owner notification: {e}")
 
             updated_history = append_to_history(conversation_history, message_text, clean_reply)
             now_iso = datetime.now(timezone.utc).isoformat()
@@ -617,6 +566,29 @@ async def receive_webhook(request: Request):
                     supabase.table("leads").insert(update_data).execute()
             except Exception as e:
                 print(f"Error saving lead to Supabase: {e}")
+
+            try:
+                lt_res = supabase.table("lead_tracking").select("*").eq("phone_number", sender_phone).execute()
+                lt_record = lt_res.data[0] if lt_res.data else None
+                
+                lt_update = {
+                    "last_message_at": now_iso,
+                    "enrolled": bool(lead_info) or (lt_record and lt_record.get("enrolled", False))
+                }
+                
+                if new_interest_level is not None:
+                    lt_update["interest_level"] = new_interest_level
+                
+                if lead_info.get("name"):
+                    lt_update["user_name"] = lead_info["name"]
+                    
+                if lt_record:
+                    supabase.table("lead_tracking").update(lt_update).eq("id", lt_record["id"]).execute()
+                else:
+                    lt_update["phone_number"] = sender_phone
+                    supabase.table("lead_tracking").insert(lt_update).execute()
+            except Exception as e:
+                print(f"Error updating lead_tracking: {e}")
 
             await send_whatsapp_message(sender_phone, clean_reply)
 
