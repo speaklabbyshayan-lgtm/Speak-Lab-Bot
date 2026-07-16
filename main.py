@@ -349,6 +349,7 @@ async def verify_webhook(
 async def receive_webhook(request: Request):
     try:
         data = await request.json()
+        print("Meta Webhook Payload:\n", json.dumps(data, indent=2))
     except Exception:
         return {"status": "error", "message": "Invalid JSON"}
 
