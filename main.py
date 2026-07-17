@@ -80,7 +80,9 @@ Step 5 → Briefly introduce SpeakLab as the solution
 Step 6 → Share program details only when they show interest
 Step 7 → Price question → PKR 20,000 — mention July batch urgency + limited seats
 Step 8 → Handle objections confidently but kindly
-Step 9 → Guide them to enroll: speaklabbyshayan.com/enroll.html or call 0301-4497532
+Step 9 → Ask which batch suits them better — Weekend or Weekday?
+         Example: "We have two batches — weekend and weekday. Which one works better for you?"
+Step 10 → Guide them to enroll: speaklabbyshayan.com/enroll.html or call 0301-4497532
 
 TALKING TO A REAL PERSON:
 If the user asks to speak to a real human/person/team/Shayan, asks for a call, or asks
@@ -105,13 +107,32 @@ URGENCY (use naturally):
 
 PROGRAM DETAILS (share only when relevant):
 - 8-week Communication & Confidence Program
-- 2 live sessions per week via Zoom
+- 2 live sessions per week, held in person at our Lahore centre
+- TWO BATCHES — the student picks whichever suits them:
+  • Weekend batch — for students busy with work/university on weekdays
+  • Weekday batch — for students free during the week
 - Maximum 15 students per batch — personal attention
 - Price: PKR 20,000
 - Certificate on completion
 - WhatsApp group support throughout
+- Class venue & location: https://www.speaklabbyshayan.com/venue.html
 - Enroll: speaklabbyshayan.com/enroll.html
 - Contact: info@speaklabbyshayan.com
+
+ATTENDING CLASS (important — be clear about this):
+- Classes are IN PERSON at our Lahore centre — attending physically is required.
+  That's where the real speaking practice happens, and it's what makes the transformation work.
+- This is NOT an online-only or self-paced course — never suggest a student can do the
+  whole program from home.
+- Every live class is recorded, and recordings are on our website:
+  • A student can rewatch any class anytime to revise
+  • If a student misses a class, they can watch that class on the website and catch up
+- Recordings are a backup and a revision tool — they are a bonus on top of the physical
+  class, never a replacement for it.
+- If they ask where the classes are held / the address / the location →
+  share the venue page: https://www.speaklabbyshayan.com/venue.html
+- If a student says they live far away or can't attend in person, be honest and warm:
+  the program is built around in-person practice, but recordings help them keep up.
 
 GOAL:
 Convert every interested person into an enrolled student. Feel like a real team member who genuinely cares about the student's growth and success.
@@ -126,6 +147,7 @@ Append the following tags exactly when applicable so the system can track progre
 - When user asks about price: <STATE>interest_level=2</STATE>
 - When user is ready to enroll/asks about enrollment: <STATE>interest_level=3</STATE>
 - When they share their name: <LEAD_CAPTURED>name=[Full Name]</LEAD_CAPTURED>
+- When they choose a batch: <LEAD_CAPTURED>batch=[Weekend or Weekday]</LEAD_CAPTURED>
 - When they ask to speak to a real person/human/team, ask for a call, or ask to be
   contacted: <HUMAN_HANDOFF>reason=[what they want]</HUMAN_HANDOFF>
 - When they share their background: <LEAD_CAPTURED>background=[Education/Profession]</LEAD_CAPTURED>
@@ -620,6 +642,10 @@ async def receive_webhook(request: Request):
                 notify_shayan = True
                 notify_status = "Shared Name"
 
+            if lead_info.get("batch"):
+                notify_shayan = True
+                notify_status = f"Chose {lead_info['batch']} Batch"
+
             if new_interest_level == 3:
                 notify_shayan = True
                 notify_status = "Ready to Enroll"
@@ -639,10 +665,12 @@ async def receive_webhook(request: Request):
                 )
                 last_msg_snippet = message_text[:100] + ("..." if len(message_text) > 100 else "")
                 now_pkt = datetime.now(timezone(timedelta(hours=5))).strftime('%Y-%m-%d %I:%M %p')
+                batch_line = f"📅 Batch: {lead_info['batch']}\n" if lead_info.get("batch") else ""
                 sir_message = (
                     f"🔔 NEW LEAD — SpeakLab Bot\n\n"
                     f"👤 Name: {user_name}\n"
                     f"📱 Number: {sender_phone}\n"
+                    f"{batch_line}"
                     f"💬 Status: {notify_status}\n"
                     f"🕐 Time: {now_pkt}\n\n"
                     f"Last message: \"{last_msg_snippet}\""
@@ -676,9 +704,11 @@ async def receive_webhook(request: Request):
 
             try:
                 if user_record:
-                    if lead_info:
+                    # Only real enrollment intent marks a lead enrolled. Capturing a
+                    # name or batch choice just means the conversation is progressing.
+                    if new_interest_level == 3:
                         update_data["status"] = "enrolled"
-                    elif user_record.get("status") == "new":
+                    elif user_record.get("status") == "new" or lead_info:
                         update_data["status"] = "interested"
                     supabase.table("leads").update(update_data).eq("id", user_record["id"]).execute()
                 else:
