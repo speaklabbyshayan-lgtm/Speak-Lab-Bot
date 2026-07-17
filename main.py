@@ -27,7 +27,11 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-OWNER_PHONE = os.environ.get("OWNER_PHONE")
+OWNER_PHONE = re.sub(r"\D", "", os.environ.get("OWNER_PHONE") or "923014497532")
+
+# Alert the owner about a lead who has sent this many messages without ever
+# giving a name, so quiet leads still reach him.
+NOTIFY_AFTER_MESSAGES = 4
 
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -65,15 +69,24 @@ CONVERSATION RULES (STRICT):
 - Show genuine interest in their situation first
 
 SALES FLOW (follow strictly, one step at a time):
-Step 1 → Warm greeting, ask what brings them here
-Step 2 → Understand their specific problem (fear? interviews? confidence? career?)
-Step 3 → Empathize genuinely — make them feel understood
-Step 4 → Briefly introduce SpeakLab as the solution
-Step 5 → Share program details only when they show interest
-Step 6 → Price question → PKR 20,000 — mention July batch urgency + limited seats
-Step 7 → Handle objections confidently but kindly
-Step 8 → Ask for their name to personalize conversation
+Step 1 → Warm greeting + ask their name FIRST, before anything else
+         Example: "Hey! I'm Sara from SpeakLab 😊 May I know your name?"
+         Never skip this — always get the name on your very first reply.
+         If they ignore the question, ask once more gently, then continue anyway.
+Step 2 → Ask what brings them here
+Step 3 → Understand their specific problem (fear? interviews? confidence? career?)
+Step 4 → Empathize genuinely — make them feel understood
+Step 5 → Briefly introduce SpeakLab as the solution
+Step 6 → Share program details only when they show interest
+Step 7 → Price question → PKR 20,000 — mention July batch urgency + limited seats
+Step 8 → Handle objections confidently but kindly
 Step 9 → Guide them to enroll: speaklabbyshayan.com/enroll.html or call 0301-4497532
+
+TALKING TO A REAL PERSON:
+If the user asks to speak to a real human/person/team/Shayan, asks for a call, or asks
+for someone to contact them — reassure them warmly and tell them the team will reach out:
+"Of course! Let me pass your details to our team — someone will reach out to you very soon 😊"
+Never refuse this request.
 
 PRICING RULES (STRICT — NEVER BREAK):
 - Program fee is PKR 20,000 — final, non-negotiable
@@ -109,10 +122,12 @@ After a student confirms their enrollment (Step 9) OR if they express high satis
 
 SYSTEM TAGS (Mandatory - hide from user):
 Append the following tags exactly when applicable so the system can track progress:
-- When you reach Step 4 or beyond: <STATE>interest_level=1</STATE>
+- When you reach Step 5 or beyond: <STATE>interest_level=1</STATE>
 - When user asks about price: <STATE>interest_level=2</STATE>
 - When user is ready to enroll/asks about enrollment: <STATE>interest_level=3</STATE>
 - When they share their name: <LEAD_CAPTURED>name=[Full Name]</LEAD_CAPTURED>
+- When they ask to speak to a real person/human/team, ask for a call, or ask to be
+  contacted: <HUMAN_HANDOFF>reason=[what they want]</HUMAN_HANDOFF>
 - When they share their background: <LEAD_CAPTURED>background=[Education/Profession]</LEAD_CAPTURED>
 - When they share how they heard: <LEAD_CAPTURED>interest=[How they heard]</LEAD_CAPTURED>
 """
@@ -209,63 +224,120 @@ def append_to_history(history: list, user_msg: str, ai_reply: str) -> list:
     return history[-60:]
 
 
+def parse_timestamp(value: str):
+    """
+    Parse a Supabase timestamp into an aware UTC datetime.
+    Naive timestamps are assumed to be UTC. Returns None if unparseable.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 async def check_reminders():
     """
     24h/48h follow-up scheduler using lead_tracking table.
     - 24h: speaklab_followup (follow_up_1_sent = true)
     - 48h: speaklab_final (follow_up_2_sent = true)
     """
-    print("Checking for dormant leads in lead_tracking...")
-    try:
-        response = supabase.table("lead_tracking").select("*").eq("enrolled", False).execute()
-        leads = response.data
-        now = datetime.now(timezone.utc)
+    run_at = datetime.now(timezone.utc)
+    print(f"[SCHEDULER] check_reminders START at {run_at.isoformat()}", flush=True)
 
-        for lead in leads:
-            last_message_time_str = lead.get("last_message_at")
-            if not last_message_time_str:
+    try:
+        # Fetch every lead and filter in Python: a Postgres `enrolled = false`
+        # filter silently skips rows where enrolled is NULL.
+        response = supabase.table("lead_tracking").select("*").execute()
+        leads = response.data or []
+    except Exception as e:
+        print(f"[SCHEDULER] ERROR fetching lead_tracking: {e}", flush=True)
+        return
+
+    active = [l for l in leads if not l.get("enrolled")]
+    print(f"[SCHEDULER] {len(leads)} lead(s) in lead_tracking, {len(active)} not enrolled", flush=True)
+
+    sent_24h = 0
+    sent_48h = 0
+    now = datetime.now(timezone.utc)
+
+    for lead in active:
+        # One bad row must never abort the whole run.
+        try:
+            phone = lead.get("phone_number")
+            if not phone:
                 continue
 
-            try:
-                if "." in last_message_time_str:
-                    last_message_time = datetime.strptime(last_message_time_str, "%Y-%m-%dT%H:%M:%S.%f%z")
-                else:
-                    last_message_time = datetime.strptime(last_message_time_str, "%Y-%m-%dT%H:%M:%S%z")
-            except Exception:
-                try:
-                    last_message_time = datetime.fromisoformat(last_message_time_str.replace("Z", "+00:00"))
-                except Exception:
-                    continue
+            last_message_time = parse_timestamp(lead.get("last_message_at"))
+            if not last_message_time:
+                print(f"[SCHEDULER] {phone}: skipped, unusable last_message_at="
+                      f"{lead.get('last_message_at')!r}", flush=True)
+                continue
 
             hours_passed = (now - last_message_time).total_seconds() / 3600
-            interest_level = lead.get("interest_level", 0)
-            f1_sent = lead.get("follow_up_1_sent", False)
-            f2_sent = lead.get("follow_up_2_sent", False)
+            # These columns are nullable; `or 0` / `bool()` keep NULL from raising.
+            interest_level = lead.get("interest_level") or 0
+            f1_sent = bool(lead.get("follow_up_1_sent"))
+            f2_sent = bool(lead.get("follow_up_2_sent"))
 
             # 48h final follow-up
             if hours_passed >= 48 and f1_sent and not f2_sent:
-                await send_template_message(lead["phone_number"], "speaklab_final")
+                print(f"[SCHEDULER] {phone}: {hours_passed:.1f}h silent -> sending speaklab_final", flush=True)
+                await send_template_message(phone, "speaklab_final")
                 supabase.table("lead_tracking").update({
                     "follow_up_2_sent": True
                 }).eq("id", lead["id"]).execute()
+                sent_48h += 1
 
             # 24h caring check-in
             elif hours_passed >= 24 and interest_level >= 1 and not f1_sent:
-                await send_template_message(lead["phone_number"], "speaklab_followup")
+                print(f"[SCHEDULER] {phone}: {hours_passed:.1f}h silent, interest={interest_level} "
+                      f"-> sending speaklab_followup", flush=True)
+                await send_template_message(phone, "speaklab_followup")
                 supabase.table("lead_tracking").update({
                     "follow_up_1_sent": True
                 }).eq("id", lead["id"]).execute()
+                sent_24h += 1
 
-    except Exception as e:
-        print(f"Error in check_reminders: {e}")
+        except Exception as e:
+            print(f"[SCHEDULER] ERROR on lead {lead.get('phone_number')}: {e}", flush=True)
+
+    print(f"[SCHEDULER] check_reminders DONE — {sent_24h} followup, {sent_48h} final", flush=True)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler.add_job(check_reminders, "interval", minutes=30)
-    scheduler.start()
+    try:
+        scheduler.add_job(
+            check_reminders,
+            "interval",
+            minutes=30,
+            id="check_reminders",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=300,
+            next_run_time=datetime.now(timezone.utc) + timedelta(seconds=20),
+        )
+        scheduler.start()
+        print(f"[SCHEDULER] STARTED — running check_reminders every 30 min. "
+              f"Owner notifications -> {OWNER_PHONE}", flush=True)
+        for job in scheduler.get_jobs():
+            print(f"[SCHEDULER] job '{job.id}' next run at {job.next_run_time}", flush=True)
+    except Exception as e:
+        print(f"[SCHEDULER] FAILED TO START: {e}", flush=True)
+
     yield
-    scheduler.shutdown()
+
+    try:
+        scheduler.shutdown(wait=False)
+        print("[SCHEDULER] shut down", flush=True)
+    except Exception as e:
+        print(f"[SCHEDULER] error during shutdown: {e}", flush=True)
 
 
 app = FastAPI(title="SpeakLab Sara Bot", lifespan=lifespan)
@@ -313,7 +385,9 @@ async def send_template_message(to_phone: str, template_name: str):
         }
         response = await client.post(url, headers=headers, json=payload)
         if response.status_code != 200:
-            print(f"Failed to send template message: {response.text}")
+            print(f"[TEMPLATE] FAILED '{template_name}' -> {to_phone}: {response.text}", flush=True)
+        else:
+            print(f"[TEMPLATE] sent '{template_name}' -> {to_phone}", flush=True)
         return response
 
 
@@ -365,6 +439,14 @@ async def receive_webhook(request: Request):
 
         if "messages" not in value:
             return {"status": "success"}
+
+        # WhatsApp profile names, keyed by wa_id — used as a name fallback in owner alerts.
+        profile_names = {}
+        for contact in value.get("contacts", []) or []:
+            wa_id = contact.get("wa_id")
+            profile_name = (contact.get("profile") or {}).get("name")
+            if wa_id and profile_name:
+                profile_names[wa_id] = profile_name
 
         for message in value["messages"]:
             sender_phone = message.get("from")
@@ -456,6 +538,16 @@ async def receive_webhook(request: Request):
                     if "=" in item:
                         k, v = item.split("=", 1)
                         lead_info[k.strip()] = v.strip()
+            handoff_info = {}
+            handoff_match = re.search(r"<HUMAN_HANDOFF>(.*?)</HUMAN_HANDOFF>", clean_reply, re.DOTALL)
+            if handoff_match:
+                handoff_str = handoff_match.group(1)
+                clean_reply = clean_reply.replace(handoff_match.group(0), "").strip()
+                for item in handoff_str.split("|"):
+                    if "=" in item:
+                        k, v = item.split("=", 1)
+                        handoff_info[k.strip()] = v.strip()
+
             feedback_match = re.search(r"<FEEDBACK_CAPTURED>(.*?)</FEEDBACK_CAPTURED>", clean_reply, re.DOTALL)
             if feedback_match:
                 feedback_str = feedback_match.group(1)
@@ -497,12 +589,20 @@ async def receive_webhook(request: Request):
                         await send_whatsapp_message(ref_phone, ref_msg)
                     except Exception as e:
                         print(f"Error handling referral: {e}")
+            # The owner is not alerted when a stranger merely says hi. Sara asks for the
+            # name on her first reply (Step 1) and the alert goes out once they give it.
+            # Least urgent trigger first — the most urgent one below wins the status.
             notify_shayan = False
-            notify_status = "New Inquiry"
+            notify_status = ""
 
-            if not user_record:
+            # Fallback so a lead who never identifies themselves is not invisible:
+            # alert once, on their Nth message, if we still have no name for them.
+            existing_name = user_record.get("name") if user_record else None
+            user_msg_count = sum(1 for m in conversation_history if m.get("role") == "user") + 1
+            if (user_msg_count == NOTIFY_AFTER_MESSAGES
+                    and not existing_name and not lead_info.get("name")):
                 notify_shayan = True
-                notify_status = "New Inquiry"
+                notify_status = f"Still Chatting — No Name After {NOTIFY_AFTER_MESSAGES} Messages"
 
             new_interest_level = None
             if "interest_level" in state_info:
@@ -514,16 +614,29 @@ async def receive_webhook(request: Request):
             if new_interest_level == 2:
                 notify_shayan = True
                 notify_status = "Asked About Price"
-            elif new_interest_level == 3:
-                notify_shayan = True
-                notify_status = "Ready to Enroll"
 
-            if lead_info.get("name"):
+            # Only the first time the name is given — the AI may repeat the tag later.
+            if lead_info.get("name") and not existing_name:
                 notify_shayan = True
                 notify_status = "Shared Name"
 
-            if notify_shayan and OWNER_PHONE:
-                user_name = lead_info.get("name") or (user_record.get("name") if user_record else "Unknown")
+            if new_interest_level == 3:
+                notify_shayan = True
+                notify_status = "Ready to Enroll"
+
+            # Most urgent: a real person is being asked for, so this wins any status above.
+            if handoff_info:
+                notify_shayan = True
+                reason = handoff_info.get("reason", "wants to talk")
+                notify_status = f"🙋 WANTS TO TALK TO A REAL PERSON — {reason}"
+
+            if notify_shayan and OWNER_PHONE and sender_phone != OWNER_PHONE:
+                user_name = (
+                    lead_info.get("name")
+                    or (user_record.get("name") if user_record else None)
+                    or profile_names.get(sender_phone)
+                    or "Unknown"
+                )
                 last_msg_snippet = message_text[:100] + ("..." if len(message_text) > 100 else "")
                 now_pkt = datetime.now(timezone(timedelta(hours=5))).strftime('%Y-%m-%d %I:%M %p')
                 sir_message = (
@@ -535,9 +648,12 @@ async def receive_webhook(request: Request):
                     f"Last message: \"{last_msg_snippet}\""
                 )
                 try:
+                    print(f"[OWNER ALERT] {notify_status} — {sender_phone} -> notifying {OWNER_PHONE}", flush=True)
                     await send_whatsapp_message(OWNER_PHONE, sir_message)
                 except Exception as e:
-                    print(f"Error sending owner notification: {e}")
+                    print(f"[OWNER ALERT] FAILED for {sender_phone}: {e}", flush=True)
+            elif notify_shayan and not OWNER_PHONE:
+                print("[OWNER ALERT] SKIPPED — OWNER_PHONE is not set", flush=True)
 
             updated_history = append_to_history(conversation_history, message_text, clean_reply)
             now_iso = datetime.now(timezone.utc).isoformat()
@@ -576,22 +692,34 @@ async def receive_webhook(request: Request):
                 lt_res = supabase.table("lead_tracking").select("*").eq("phone_number", sender_phone).execute()
                 lt_record = lt_res.data[0] if lt_res.data else None
                 
+                # enrolled must stay a real boolean: a NULL here is skipped by the
+                # follow-up query. Capturing a name/background is not an enrollment,
+                # so only an already-enrolled lead stays enrolled.
                 lt_update = {
                     "last_message_at": now_iso,
-                    "enrolled": bool(lead_info) or (lt_record and lt_record.get("enrolled", False))
+                    "enrolled": bool(lt_record and lt_record.get("enrolled")),
                 }
-                
+
                 if new_interest_level is not None:
                     lt_update["interest_level"] = new_interest_level
-                
+
                 if lead_info.get("name"):
                     lt_update["user_name"] = lead_info["name"]
-                    
+
                 if lt_record:
+                    # The lead replied, so restart the 24h/48h follow-up clock.
+                    lt_update["follow_up_1_sent"] = False
+                    lt_update["follow_up_2_sent"] = False
                     supabase.table("lead_tracking").update(lt_update).eq("id", lt_record["id"]).execute()
+                    print(f"[TRACKING] updated {sender_phone} — "
+                          f"interest={lt_update.get('interest_level', lt_record.get('interest_level'))}", flush=True)
                 else:
                     lt_update["phone_number"] = sender_phone
+                    lt_update.setdefault("interest_level", 0)
+                    lt_update["follow_up_1_sent"] = False
+                    lt_update["follow_up_2_sent"] = False
                     supabase.table("lead_tracking").insert(lt_update).execute()
+                    print(f"[TRACKING] inserted new lead {sender_phone}", flush=True)
             except Exception as e:
                 print(f"Error updating lead_tracking: {e}")
 
