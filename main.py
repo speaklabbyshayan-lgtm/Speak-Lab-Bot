@@ -3,8 +3,12 @@ import httpx
 import tempfile
 import re
 import json
+import hmac
+import hashlib
+import time
+from collections import deque, defaultdict
 from datetime import datetime, timezone, timedelta
-from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi import FastAPI, Request, HTTPException, Query, Header
 from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 from groq import AsyncGroq
@@ -32,6 +36,82 @@ OWNER_PHONE = re.sub(r"\D", "", os.environ.get("OWNER_PHONE") or "923014497532")
 # Alert the owner about a lead who has sent this many messages without ever
 # giving a name, so quiet leads still reach him.
 NOTIFY_AFTER_MESSAGES = 4
+
+# --- Anti-spam / security config -------------------------------------------
+# Meta signs every webhook with this app secret. When set, forged payloads are
+# rejected. Left unset, verification is skipped (bot still runs) — set it ASAP.
+META_APP_SECRET = os.environ.get("META_APP_SECRET") or os.environ.get("APP_SECRET")
+
+# Shared secret required to trigger /broadcast. If unset, the endpoint is
+# disabled entirely (fail-closed) so it can never be abused unconfigured.
+BROADCAST_SECRET = os.environ.get("BROADCAST_SECRET")
+
+# Per-sender flood control: at most RATE_LIMIT_MAX messages per RATE_LIMIT_WINDOW
+# seconds. Over that, warn the sender once, then ignore until the window resets.
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
+RATE_LIMIT_MAX = int(os.environ.get("RATE_LIMIT_MAX", "20"))
+
+# In-memory anti-spam state (single instance). Resets on restart, which is fine.
+_msg_times = defaultdict(deque)   # phone -> deque[monotonic timestamps in window]
+_flood_warned = {}                # phone -> monotonic time we last warned them
+_seen_ids = deque(maxlen=5000)    # recent WhatsApp message IDs (dedup ring)
+_seen_set = set()                 # same IDs, for O(1) membership
+
+
+def verify_meta_signature(raw_body: bytes, signature_header: str) -> bool:
+    """
+    Validate Meta's X-Hub-Signature-256 (HMAC-SHA256 of the raw body with the
+    app secret). Fail-open when no secret is configured so the bot keeps working,
+    but that path is warned about loudly at startup.
+    """
+    if not META_APP_SECRET:
+        return True
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = hmac.new(META_APP_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
+    provided = signature_header.split("=", 1)[1]
+    return hmac.compare_digest(expected, provided)
+
+
+def is_duplicate_message(message_id: str) -> bool:
+    """True if this WhatsApp message ID was already handled (Meta retries / replays)."""
+    if not message_id:
+        return False
+    if message_id in _seen_set:
+        return True
+    if len(_seen_ids) == _seen_ids.maxlen:
+        _seen_set.discard(_seen_ids[0])  # evict oldest as the ring wraps
+    _seen_ids.append(message_id)
+    _seen_set.add(message_id)
+    return False
+
+
+def rate_limit_status(phone: str) -> str:
+    """
+    Returns "ok" (process it), "warn" (first breach — send one notice), or
+    "silent" (still flooding — ignore). The owner is never rate limited.
+    """
+    if phone == OWNER_PHONE:
+        return "ok"
+    now = time.monotonic()
+    dq = _msg_times[phone]
+    while dq and now - dq[0] > RATE_LIMIT_WINDOW:
+        dq.popleft()
+
+    if len(dq) >= RATE_LIMIT_MAX:
+        last_warn = _flood_warned.get(phone, 0)
+        if now - last_warn > RATE_LIMIT_WINDOW:
+            _flood_warned[phone] = now
+            return "warn"
+        return "silent"
+
+    dq.append(now)
+    # Opportunistic cleanup so the dicts don't grow unbounded over a long uptime.
+    if len(_msg_times) > 10000:
+        for p in [p for p, d in _msg_times.items() if not d]:
+            _msg_times.pop(p, None)
+            _flood_warned.pop(p, None)
+    return "ok"
 
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -333,6 +413,13 @@ async def check_reminders():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Security posture, visible in Railway logs on every boot.
+    print(f"[SECURITY] webhook signature check: "
+          f"{'ENABLED' if META_APP_SECRET else 'DISABLED — set META_APP_SECRET to reject forged webhooks'}", flush=True)
+    print(f"[SECURITY] /broadcast: "
+          f"{'PROTECTED' if BROADCAST_SECRET else 'DISABLED — set BROADCAST_SECRET to enable it'}", flush=True)
+    print(f"[SECURITY] rate limit: {RATE_LIMIT_MAX} messages / {RATE_LIMIT_WINDOW}s per sender", flush=True)
+
     try:
         scheduler.add_job(
             check_reminders,
@@ -443,8 +530,14 @@ async def verify_webhook(
 
 @app.post("/webhook")
 async def receive_webhook(request: Request):
+    # Read the raw body first — signature verification must run on the exact bytes.
+    raw_body = await request.body()
+    if not verify_meta_signature(raw_body, request.headers.get("X-Hub-Signature-256", "")):
+        print("[SECURITY] Rejected webhook — invalid/missing X-Hub-Signature-256", flush=True)
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
     try:
-        data = await request.json()
+        data = json.loads(raw_body)
         print("Meta Webhook Payload:\n", json.dumps(data, indent=2))
     except Exception:
         return {"status": "error", "message": "Invalid JSON"}
@@ -472,8 +565,31 @@ async def receive_webhook(request: Request):
 
         for message in value["messages"]:
             sender_phone = message.get("from")
+            message_id = message.get("id")
             message_type = message.get("type")
             message_text = ""
+
+            if not sender_phone:
+                continue
+
+            # Meta retries webhooks and attackers replay them — process each once.
+            if is_duplicate_message(message_id):
+                print(f"[DEDUP] skipping already-handled message {message_id}", flush=True)
+                continue
+
+            # Flood control before any paid AI call or outbound send.
+            status = rate_limit_status(sender_phone)
+            if status == "warn":
+                print(f"[RATE] {sender_phone} over limit "
+                      f"({RATE_LIMIT_MAX}/{RATE_LIMIT_WINDOW}s) — warning once", flush=True)
+                await send_whatsapp_message(
+                    sender_phone,
+                    "You're sending messages quite fast 😊 Give me a moment to catch up and I'll reply!"
+                )
+                continue
+            elif status == "silent":
+                print(f"[RATE] {sender_phone} still flooding — ignoring", flush=True)
+                continue
 
             if message_type == "text":
                 message_text = message.get("text", {}).get("body", "")
@@ -763,7 +879,19 @@ async def receive_webhook(request: Request):
 
 
 @app.post("/broadcast")
-async def send_broadcast(request: BroadcastRequest):
+async def send_broadcast(
+    request: BroadcastRequest,
+    x_broadcast_secret: str = Header(None, alias="X-Broadcast-Secret"),
+):
+    # Fail-closed: with no secret configured the endpoint is disabled, so it can
+    # never be used to blast messages while unprotected.
+    if not BROADCAST_SECRET:
+        print("[SECURITY] /broadcast blocked — BROADCAST_SECRET not configured", flush=True)
+        raise HTTPException(status_code=503, detail="Broadcast disabled: secret not configured")
+    if not hmac.compare_digest(x_broadcast_secret or "", BROADCAST_SECRET):
+        print("[SECURITY] /broadcast rejected — wrong or missing X-Broadcast-Secret", flush=True)
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     success_count = 0
     for phone in request.phone_list:
         try:
