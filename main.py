@@ -16,6 +16,7 @@ import google.generativeai as genai
 from supabase import create_client, Client
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
 from pydantic import BaseModel
 from typing import List
 from mutagen.oggvorbis import OggVorbis
@@ -31,11 +32,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-OWNER_PHONE = re.sub(r"\D", "", os.environ.get("OWNER_PHONE") or "923014497532")
-
-# Alert the owner about a lead who has sent this many messages without ever
-# giving a name, so quiet leads still reach him.
-NOTIFY_AFTER_MESSAGES = 4
+OWNER_PHONE = re.sub(r"\D", "", os.environ.get("OWNER_PHONE") or "923294862198")
 
 # --- Anti-spam / security config -------------------------------------------
 # Meta signs every webhook with this app secret. When set, forged payloads are
@@ -45,6 +42,10 @@ META_APP_SECRET = os.environ.get("META_APP_SECRET") or os.environ.get("APP_SECRE
 # Shared secret required to trigger /broadcast. If unset, the endpoint is
 # disabled entirely (fail-closed) so it can never be abused unconfigured.
 BROADCAST_SECRET = os.environ.get("BROADCAST_SECRET")
+
+# Secret required to trigger /cron/followup from an external scheduler
+# (e.g. cron-job.org). This is what actually survives Railway spin-down.
+CRON_SECRET = os.environ.get("CRON_SECRET", "speaklab2026")
 
 # Per-sender flood control: at most RATE_LIMIT_MAX messages per RATE_LIMIT_WINDOW
 # seconds. Over that, warn the sender once, then ignore until the window resets.
@@ -163,10 +164,16 @@ Step 1 → Warm greeting + ask their name FIRST, before anything else
 Step 2 → Ask what brings them here
 Step 3 → Understand their specific problem (fear? interviews? confidence? career?)
 Step 4 → Empathize genuinely — make them feel understood
+         If they seem hesitant or unsure at this point, you may naturally add:
+         "By the way, we actually have a free 2-day experience where you can join live
+         sessions before committing — want me to get you a slot? 😊"
 Step 5 → Briefly introduce SpeakLab as the solution
 Step 6 → Share program details only when they show interest
-Step 7 → Price question → PKR 20,000 — mention July batch urgency + limited seats
+Step 7 → Price question → PKR 20,000 (early bird) — mention August batch urgency + limited seats
 Step 8 → Handle objections confidently but kindly
+         If they're still hesitant after this, you may naturally add:
+         "There's also a completely FREE seminar on 28th July in Lahore — perfect to
+         experience SpeakLab before deciding. Want details? 🎤"
 Step 9 → Ask which batch suits them better — Weekend or Weekday?
          Example: "We have two batches — weekend and weekday. Which one works better for you?"
 Step 10 → Guide them to enroll: speaklabbyshayan.com/enroll.html or call 0301-4497532
@@ -188,7 +195,8 @@ PRICING RULES (STRICT — NEVER BREAK):
 - Price is PKR 20,000. Always. No exceptions.
 
 URGENCY (use naturally):
-- "July batch is starting soon — seats are almost full"
+- "August batch starts 1st August 2026 — seats are almost full"
+- "Early bird price is PKR 20,000, limited to 15 students only"
 - "We only take 15 students per batch for quality"
 - "Students who join early get the most transformation"
 
@@ -198,13 +206,31 @@ PROGRAM DETAILS (share only when relevant):
 - TWO BATCHES — the student picks whichever suits them:
   • Weekend batch — for students busy with work/university on weekdays
   • Weekday batch — for students free during the week
-- Maximum 15 students per batch — personal attention
-- Price: PKR 20,000
+- August batch starts 1st August 2026
+- Early bird price: PKR 20,000 — limited to 15 students only, for personal attention
 - Certificate on completion
 - WhatsApp group support throughout
 - Class venue & location: https://www.speaklabbyshayan.com/venue.html
 - Enroll: speaklabbyshayan.com/enroll.html
 - Contact: info@speaklabbyshayan.com
+
+FREE 2-DAY EXPERIENCE:
+- SpeakLab offers a free 2-day experience before enrolling
+- Day 1: Join a live session — watch, listen, participate comfortably
+- Day 2: Practice with real students, get coach feedback
+- After 2 days: if they love it, they can enroll in the full August batch
+- Only 5 experience slots available per batch
+- To claim it → send a message to wa.me/923014497532
+- Mention this naturally when a student is hesitant about price or commitment — never pushy
+
+FREE SEMINAR:
+- Date: 28th July 2026
+- Location: Lahore (exact venue shared on WhatsApp after registration)
+- Cost: Completely FREE
+- Limited seats available
+- Perfect for anyone who wants to experience SpeakLab before committing
+- To register → message 0301-4497532
+- Mention this when a student says they want to "think about it" or seems unsure
 
 ATTENDING CLASS (important — be clear about this):
 - Classes are IN PERSON at our Lahore centre — attending physically is required.
@@ -225,7 +251,7 @@ GOAL:
 Convert every interested person into an enrolled student. Feel like a real team member who genuinely cares about the student's growth and success.
 
 GOOGLE REVIEW (MANDATORY):
-After a student confirms their enrollment (Step 9) OR if they express high satisfaction/happiness at any point, you MUST ask them to leave a Google review:
+After a student confirms their enrollment (Step 10) OR if they express high satisfaction/happiness at any point, you MUST ask them to leave a Google review:
 "By the way — it would mean the world to us if you could drop a quick Google review! Here's the link: https://g.page/r/CdPtj9VpwqqKEBM/review — takes 30 seconds! 😊"
 
 SYSTEM TAGS (Mandatory - hide from user):
@@ -392,6 +418,8 @@ async def check_reminders():
             interest_level = lead.get("interest_level") or 0
             f1_sent = bool(lead.get("follow_up_1_sent"))
             f2_sent = bool(lead.get("follow_up_2_sent"))
+            print(f"[SCHEDULER] {phone}: {hours_passed:.1f}h since last message "
+                  f"(interest={interest_level}, f1={f1_sent}, f2={f2_sent})", flush=True)
 
             # 48h final follow-up
             if hours_passed >= 48 and f1_sent and not f2_sent:
@@ -418,6 +446,32 @@ async def check_reminders():
     print(f"[SCHEDULER] check_reminders DONE — {sent_24h} followup, {sent_48h} final", flush=True)
 
 
+async def ping_self():
+    """
+    Keep the Railway app awake by hitting its own /health every few minutes.
+    Only works while the app is already running; the external cron on
+    /cron/followup is the real safety net if Railway fully spins the app down.
+    """
+    app_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+    if not app_url:
+        print("[KEEPALIVE] RAILWAY_PUBLIC_DOMAIN not set — skipping self-ping", flush=True)
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            await client.get(f"https://{app_url}/health")
+        print("✅ [KEEPALIVE] Self ping successful", flush=True)
+    except Exception as e:
+        print(f"[KEEPALIVE] Self ping failed: {e}", flush=True)
+
+
+def scheduler_error_listener(event):
+    """Surface every scheduler job outcome so failures never die silently."""
+    if event.exception:
+        print(f"❌ [SCHEDULER] job '{event.job_id}' failed: {event.exception}", flush=True)
+    else:
+        print(f"✅ [SCHEDULER] job '{event.job_id}' completed successfully", flush=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Security posture, visible in Railway logs on every boot.
@@ -428,6 +482,9 @@ async def lifespan(app: FastAPI):
     print(f"[SECURITY] rate limit: {RATE_LIMIT_MAX} messages / {RATE_LIMIT_WINDOW}s per sender", flush=True)
 
     try:
+        # Log every job outcome so a silently-dying scheduler is visible in Railway.
+        scheduler.add_listener(scheduler_error_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
+
         scheduler.add_job(
             check_reminders,
             "interval",
@@ -439,8 +496,18 @@ async def lifespan(app: FastAPI):
             misfire_grace_time=300,
             next_run_time=datetime.now(timezone.utc) + timedelta(seconds=20),
         )
+        # Keep-alive: ping our own /health every 10 min so Railway keeps us awake.
+        scheduler.add_job(
+            ping_self,
+            "interval",
+            minutes=10,
+            id="self_ping",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
         scheduler.start()
-        print(f"[SCHEDULER] STARTED — running check_reminders every 30 min. "
+        print(f"[SCHEDULER] STARTED — check_reminders every 30 min, self_ping every 10 min. "
               f"Owner notifications -> {OWNER_PHONE}", flush=True)
         for job in scheduler.get_jobs():
             print(f"[SCHEDULER] job '{job.id}' next run at {job.next_run_time}", flush=True)
@@ -734,20 +801,11 @@ async def receive_webhook(request: Request):
                         await send_whatsapp_message(ref_phone, ref_msg)
                     except Exception as e:
                         print(f"Error handling referral: {e}")
-            # The owner is not alerted when a stranger merely says hi. Sara asks for the
-            # name on her first reply (Step 1) and the alert goes out once they give it.
-            # Least urgent trigger first — the most urgent one below wins the status.
-            notify_shayan = False
-            notify_status = ""
-
-            # Fallback so a lead who never identifies themselves is not invisible:
-            # alert once, on their Nth message, if we still have no name for them.
+            # Owner notification: every single incoming message notifies the owner —
+            # no gating, no "only if interesting". Status is a plain text label
+            # computed from keywords in the student's own message.
             existing_name = user_record.get("name") if user_record else None
-            user_msg_count = sum(1 for m in conversation_history if m.get("role") == "user") + 1
-            if (user_msg_count == NOTIFY_AFTER_MESSAGES
-                    and not existing_name and not lead_info.get("name")):
-                notify_shayan = True
-                notify_status = f"Still Chatting — No Name After {NOTIFY_AFTER_MESSAGES} Messages"
+            is_new_user = user_record is None
 
             new_interest_level = None
             if "interest_level" in state_info:
@@ -756,54 +814,50 @@ async def receive_webhook(request: Request):
                 except ValueError:
                     pass
 
-            if new_interest_level == 2:
-                notify_shayan = True
-                notify_status = "Asked About Price"
+            text_lower = message_text.lower()
+            enroll_keywords = ["enroll", "enrol", "join", "sign up", "signup", "admission"]
+            price_keywords = ["price", "cost", "fee", "fees", "charges", "kitna", "kitne", "pkr"]
+            free_keywords = ["seminar", "free"]
 
-            # Only the first time the name is given — the AI may repeat the tag later.
-            if lead_info.get("name") and not existing_name:
-                notify_shayan = True
-                notify_status = "Shared Name"
-
-            if lead_info.get("batch"):
-                notify_shayan = True
-                notify_status = f"Chose {lead_info['batch']} Batch"
-
-            if new_interest_level == 3:
-                notify_shayan = True
-                notify_status = "Ready to Enroll"
-
-            # Most urgent: a real person is being asked for, so this wins any status above.
             if handoff_info:
-                notify_shayan = True
-                reason = handoff_info.get("reason", "wants to talk")
-                notify_status = f"🙋 WANTS TO TALK TO A REAL PERSON — {reason}"
+                # Not in the original 5-status list, but kept as the most urgent
+                # label since it means the student explicitly wants a human — cheap
+                # to keep, easy to remove if you'd rather stick to the exact 5.
+                notify_status = "🙋 Wants Real Person"
+            elif any(k in text_lower for k in enroll_keywords):
+                notify_status = "🚀 Ready to Enroll"
+            elif any(k in text_lower for k in price_keywords):
+                notify_status = "🔥 Hot Lead"
+            elif any(k in text_lower for k in free_keywords):
+                notify_status = "🎯 Interested in Free Options"
+            elif is_new_user:
+                notify_status = "🆕 New User"
+            else:
+                notify_status = "🔄 Returning"
 
-            if notify_shayan and OWNER_PHONE and sender_phone != OWNER_PHONE:
+            if OWNER_PHONE and sender_phone != OWNER_PHONE:
                 user_name = (
                     lead_info.get("name")
-                    or (user_record.get("name") if user_record else None)
+                    or existing_name
                     or profile_names.get(sender_phone)
                     or "Unknown"
                 )
-                last_msg_snippet = message_text[:100] + ("..." if len(message_text) > 100 else "")
+                msg_snippet = message_text[:200] + ("..." if len(message_text) > 200 else "")
                 now_pkt = datetime.now(timezone(timedelta(hours=5))).strftime('%Y-%m-%d %I:%M %p')
-                batch_line = f"📅 Batch: {lead_info['batch']}\n" if lead_info.get("batch") else ""
-                sir_message = (
-                    f"🔔 NEW LEAD — SpeakLab Bot\n\n"
+                owner_message = (
+                    f"🔔 SpeakLab Bot Alert\n\n"
                     f"👤 Name: {user_name}\n"
                     f"📱 Number: {sender_phone}\n"
-                    f"{batch_line}"
-                    f"💬 Status: {notify_status}\n"
-                    f"🕐 Time: {now_pkt}\n\n"
-                    f"Last message: \"{last_msg_snippet}\""
+                    f"💬 Message: \"{msg_snippet}\"\n"
+                    f"🕐 Time: {now_pkt}\n"
+                    f"📊 Status: {notify_status}"
                 )
                 try:
                     print(f"[OWNER ALERT] {notify_status} — {sender_phone} -> notifying {OWNER_PHONE}", flush=True)
-                    await send_whatsapp_message(OWNER_PHONE, sir_message)
+                    await send_whatsapp_message(OWNER_PHONE, owner_message)
                 except Exception as e:
                     print(f"[OWNER ALERT] FAILED for {sender_phone}: {e}", flush=True)
-            elif notify_shayan and not OWNER_PHONE:
+            elif not OWNER_PHONE:
                 print("[OWNER ALERT] SKIPPED — OWNER_PHONE is not set", flush=True)
 
             updated_history = append_to_history(conversation_history, message_text, clean_reply)
@@ -918,6 +972,28 @@ async def send_broadcast(
         print(f"Error saving broadcast: {e}")
 
     return {"status": "success", "sent": success_count, "total": len(request.phone_list)}
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "alive", "scheduler": scheduler.running}
+
+
+@app.post("/cron/followup")
+async def trigger_followup(request: Request):
+    """
+    External-cron entry point for the 24h/48h follow-up check. Hitting this every
+    30 min from cron-job.org both keeps Railway awake AND runs the follow-ups even
+    if the in-process scheduler was killed by a spin-down.
+    """
+    auth_header = request.headers.get("X-Cron-Secret")
+    if auth_header != CRON_SECRET:
+        print("[CRON] /cron/followup rejected — wrong or missing X-Cron-Secret", flush=True)
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    print("🕐 [CRON] /cron/followup triggered — running follow-up check", flush=True)
+    await check_reminders()
+    return {"status": "followup check completed"}
 
 
 @app.get("/")
