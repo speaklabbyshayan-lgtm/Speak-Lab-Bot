@@ -847,9 +847,10 @@ async def receive_webhook(request: Request):
                         await send_whatsapp_message(ref_phone, ref_msg)
                     except Exception as e:
                         print(f"Error handling referral: {e}")
-            # Owner notification: every single incoming message notifies the owner —
-            # no gating, no "only if interesting". Status is a plain text label
-            # computed from keywords in the student's own message.
+            # Owner notifications: 5 specific situations ALWAYS alert the owner
+            # (923294862198) with a plain-text WhatsApp message. A single incoming
+            # message can match more than one situation; each match sends its own
+            # alert. Any send failure is logged but never crashes the bot.
             existing_name = user_record.get("name") if user_record else None
             is_new_user = user_record is None
 
@@ -861,59 +862,111 @@ async def receive_webhook(request: Request):
                     pass
 
             text_lower = message_text.lower()
-            enroll_keywords = ["enroll", "enrol", "join", "sign up", "signup", "admission"]
-            price_keywords = ["price", "cost", "fee", "fees", "charges", "kitna", "kitne", "pkr"]
-            free_keywords = ["seminar", "free"]
 
-            if handoff_info:
-                # Not in the original 5-status list, but kept as the most urgent
-                # label since it means the student explicitly wants a human — cheap
-                # to keep, easy to remove if you'd rather stick to the exact 5.
-                notify_status = "🙋 Wants Real Person"
-            elif any(k in text_lower for k in enroll_keywords):
-                notify_status = "🚀 Ready to Enroll"
-            elif any(k in text_lower for k in price_keywords):
-                notify_status = "🔥 Hot Lead"
-            elif any(k in text_lower for k in free_keywords):
-                notify_status = "🎯 Interested in Free Options"
-            elif is_new_user:
-                notify_status = "🆕 New User"
-            else:
-                notify_status = "🔄 Returning"
+            def _matches(keywords: list) -> bool:
+                # Word-boundary match so short keywords (e.g. "aap", "start") don't
+                # fire on substrings inside unrelated words. Multi-word phrases work
+                # too since \b anchors each end of the escaped phrase.
+                for kw in keywords:
+                    if re.search(r"\b" + re.escape(kw) + r"\b", text_lower):
+                        return True
+                return False
 
-            if OWNER_PHONE and sender_phone != OWNER_PHONE:
-                user_name = (
-                    lead_info.get("name")
-                    or existing_name
-                    or profile_names.get(sender_phone)
-                    or "Unknown"
-                )
-                msg_snippet = message_text[:200] + ("..." if len(message_text) > 200 else "")
-                now_pkt = datetime.now(timezone(timedelta(hours=5))).strftime('%Y-%m-%d %I:%M %p')
-                owner_message = (
-                    f"🔔 SpeakLab Bot Alert\n\n"
+            price_keywords = ["price", "cost", "fees", "kitna", "amount", "how much"]
+            enroll_interest_keywords = ["enroll", "join", "register", "admission", "start", "batch"]
+            human_keywords = [
+                "human", "real person", "agent", "banda", "aap", "shayan", "teacher",
+                "coach", "call me", "call karo", "phone karo", "baat karni hai", "speak to someone",
+            ]
+            seminar_keywords = ["seminar", "free experience"]
+            ready_keywords = [
+                "yes", "confirm", "ready", "enroll karna hai", "join karna hai", "seat book", "payment",
+            ]
+
+            wants_human = bool(handoff_info) or _matches(human_keywords)
+
+            user_name = (
+                lead_info.get("name")
+                or existing_name
+                or profile_names.get(sender_phone)
+                or "Unknown"
+            )
+            now_pkt = datetime.now(timezone(timedelta(hours=5))).strftime('%Y-%m-%d %I:%M %p')
+
+            owner_alerts = []
+
+            # TRIGGER 1 — New user (very first message from this number)
+            if is_new_user:
+                owner_alerts.append(
+                    f"🆕 NEW LEAD\n\n"
                     f"👤 Name: {user_name}\n"
                     f"📱 Number: {sender_phone}\n"
-                    f"💬 Message: \"{msg_snippet}\"\n"
-                    f"🕐 Time: {now_pkt}\n"
-                    f"📊 Status: {notify_status}"
+                    f"💬 First message: \"{message_text}\"\n"
+                    f"🕐 Time: {now_pkt}"
                 )
-                try:
-                    print(f"[OWNER ALERT] {notify_status} — {sender_phone} -> notifying {OWNER_PHONE}", flush=True)
-                    resp = await send_whatsapp_message(OWNER_PHONE, owner_message)
-                    # Free-form text only delivers inside the owner's 24h window,
-                    # which is usually closed. On any non-200, fall back to the
-                    # approved template, which delivers regardless of the window.
-                    if resp is None or resp.status_code != 200:
-                        print(f"[OWNER ALERT] free-text failed (window likely closed) -> "
-                              f"template '{OWNER_ALERT_TEMPLATE}'", flush=True)
-                        await send_template_with_params(
-                            OWNER_PHONE,
-                            OWNER_ALERT_TEMPLATE,
-                            [user_name, sender_phone, notify_status, msg_snippet or "(no text)"],
-                        )
-                except Exception as e:
-                    print(f"[OWNER ALERT] FAILED for {sender_phone}: {e}", flush=True)
+
+            # TRIGGER 5 — Ready to enroll
+            if _matches(ready_keywords):
+                owner_alerts.append(
+                    f"🚀 READY TO ENROLL — ACT NOW!\n\n"
+                    f"👤 Name: {user_name}\n"
+                    f"📱 Number: {sender_phone}\n"
+                    f"💬 Message: \"{message_text}\"\n"
+                    f"🕐 Time: {now_pkt}"
+                )
+
+            # TRIGGER 3 — Wants a human
+            if wants_human:
+                owner_alerts.append(
+                    f"🚨 NEEDS HUMAN — RESPOND NOW\n\n"
+                    f"👤 Name: {user_name}\n"
+                    f"📱 Number: {sender_phone}\n"
+                    f"💬 Message: \"{message_text}\"\n"
+                    f"🕐 Time: {now_pkt}"
+                )
+
+            # TRIGGER 2 — Shows interest (price / enrollment)
+            is_price = _matches(price_keywords)
+            if is_price or _matches(enroll_interest_keywords):
+                interest = "Price Inquiry" if is_price else "Enrollment Interest"
+                owner_alerts.append(
+                    f"🔥 HOT LEAD\n\n"
+                    f"👤 Name: {user_name}\n"
+                    f"📱 Number: {sender_phone}\n"
+                    f"💬 Message: \"{message_text}\"\n"
+                    f"📊 Interest: {interest}\n"
+                    f"🕐 Time: {now_pkt}"
+                )
+
+            # TRIGGER 4 — Seminar / free experience interest
+            if _matches(seminar_keywords):
+                owner_alerts.append(
+                    f"🎤 SEMINAR INTEREST\n\n"
+                    f"👤 Name: {user_name}\n"
+                    f"📱 Number: {sender_phone}\n"
+                    f"💬 Message: \"{message_text}\"\n"
+                    f"🕐 Time: {now_pkt}"
+                )
+
+            # When the user wants a human, Sara reassures them and shares the direct
+            # WhatsApp number — on top of the owner alert above.
+            if wants_human:
+                human_line = (
+                    "Of course! I've already notified our team — someone will reach out "
+                    "to you very shortly 😊 You can also directly WhatsApp: 0301-4497532"
+                )
+                if "0301-4497532" not in clean_reply:
+                    clean_reply = f"{clean_reply}\n\n{human_line}".strip() if clean_reply else human_line
+
+            if OWNER_PHONE and sender_phone != OWNER_PHONE:
+                for alert in owner_alerts:
+                    header = alert.split("\n", 1)[0]
+                    try:
+                        print(f"[OWNER ALERT] {header} — {sender_phone} -> notifying {OWNER_PHONE}", flush=True)
+                        await send_whatsapp_message(OWNER_PHONE, alert)
+                    except Exception as e:
+                        # Log and keep going: a failed owner alert must never crash the bot.
+                        print(f"[OWNER ALERT] FAILED for {sender_phone}: {e}", flush=True)
             elif not OWNER_PHONE:
                 print("[OWNER ALERT] SKIPPED — OWNER_PHONE is not set", flush=True)
 
