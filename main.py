@@ -33,6 +33,10 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 OWNER_PHONE = re.sub(r"\D", "", os.environ.get("OWNER_PHONE") or "923294862198")
+# Approved WhatsApp template used to alert the owner about a new lead. Free-form
+# text only reaches the owner inside the 24h window (which is usually closed since
+# the owner rarely messages the bot), so this template is the reliable path.
+OWNER_ALERT_TEMPLATE = os.environ.get("OWNER_ALERT_TEMPLATE", "new_lead_alert")
 
 # --- Anti-spam / security config -------------------------------------------
 # Meta signs every webhook with this app secret. When set, forged payloads are
@@ -576,6 +580,46 @@ async def send_template_message(to_phone: str, template_name: str):
         return response
 
 
+async def send_template_with_params(to_phone: str, template_name: str, params: List[str]):
+    """
+    Send an approved template that has {{1}}..{{n}} body variables. Unlike a
+    free-form text message, a template reaches the recipient even when the 24h
+    customer-service window is closed — which is why owner lead alerts use it.
+    """
+    async with httpx.AsyncClient() as client:
+        url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_phone,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": "en"},
+                "components": [
+                    {
+                        "type": "body",
+                        # WhatsApp rejects template params containing newlines/tabs or
+                        # runs of 4+ spaces, so collapse all whitespace to single spaces.
+                        "parameters": [
+                            {"type": "text", "text": re.sub(r"\s+", " ", str(p)).strip() or "-"}
+                            for p in params
+                        ],
+                    }
+                ],
+            },
+        }
+        response = await client.post(url, headers=headers, json=payload)
+        if response.status_code != 200:
+            print(f"[TEMPLATE] FAILED '{template_name}' -> {to_phone}: {response.text}", flush=True)
+        else:
+            print(f"[TEMPLATE] sent '{template_name}' -> {to_phone}", flush=True)
+        return response
+
+
 async def download_whatsapp_media(media_id: str):
     async with httpx.AsyncClient() as client:
         url = f"https://graph.facebook.com/v19.0/{media_id}"
@@ -856,7 +900,18 @@ async def receive_webhook(request: Request):
                 )
                 try:
                     print(f"[OWNER ALERT] {notify_status} — {sender_phone} -> notifying {OWNER_PHONE}", flush=True)
-                    await send_whatsapp_message(OWNER_PHONE, owner_message)
+                    resp = await send_whatsapp_message(OWNER_PHONE, owner_message)
+                    # Free-form text only delivers inside the owner's 24h window,
+                    # which is usually closed. On any non-200, fall back to the
+                    # approved template, which delivers regardless of the window.
+                    if resp is None or resp.status_code != 200:
+                        print(f"[OWNER ALERT] free-text failed (window likely closed) -> "
+                              f"template '{OWNER_ALERT_TEMPLATE}'", flush=True)
+                        await send_template_with_params(
+                            OWNER_PHONE,
+                            OWNER_ALERT_TEMPLATE,
+                            [user_name, sender_phone, notify_status, msg_snippet or "(no text)"],
+                        )
                 except Exception as e:
                     print(f"[OWNER ALERT] FAILED for {sender_phone}: {e}", flush=True)
             elif not OWNER_PHONE:
