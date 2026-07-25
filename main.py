@@ -1,4 +1,5 @@
 import os
+import asyncio
 import httpx
 import tempfile
 import re
@@ -30,6 +31,42 @@ WABA_ID = os.environ.get("WABA_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "speaklab_verify_token")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# --- NVIDIA NIM (primary provider) -----------------------------------------
+# OpenAI-compatible chat-completions endpoint. Called with plain httpx rather
+# than the openai SDK so no new dependency is added to the Railway deploy —
+# the rest of this file already talks to HTTP APIs the same way.
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
+NVIDIA_BASE_URL = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+# Benchmarked against this account: the small llama instruct models answer in
+# about a second, while gpt-oss-120b took 60-180s (and often timed out) and
+# llama-3.3-70b / ministral-14b timed out entirely. Speed matters more than size
+# here because the WhatsApp webhook waits on this call.
+NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "meta/llama-4-maverick-17b-128e-instruct")
+# gpt-oss is a reasoning model: it spends tokens thinking before it answers, so
+# a tight cap returns reasoning_content with content=None. Measured: max_tokens=64
+# produced an empty answer. Keep real headroom.
+NVIDIA_MAX_TOKENS = int(os.environ.get("NVIDIA_MAX_TOKENS", "1024"))
+# Only meaningful for reasoning models such as gpt-oss. Left empty by default
+# because a plain instruct model like llama-3.1-8b has no use for it — set it
+# only if NVIDIA_MODEL is switched to a reasoning model.
+NVIDIA_REASONING_EFFORT = os.environ.get("NVIDIA_REASONING_EFFORT", "")
+# llama-3.1-8b answers in about a second, so anything past this is a stall and
+# we're better off failing over to Groq than making the lead wait.
+NVIDIA_TIMEOUT = float(os.environ.get("NVIDIA_TIMEOUT", "25"))
+
+# Model names are env-overridable so a retired model can be swapped without a
+# code change. gemini-1.5-flash was retired by Google in Sept 2025 — do not
+# reintroduce it. Groq's fallback model is tried if the primary one errors.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant")
+
+# Only the last N messages of history are sent to the model. Groq's free tier
+# allows 12k tokens/minute and SYSTEM_PROMPT alone is ~2k, so sending the full
+# 60-message history burns the whole per-minute budget on one or two replies
+# and everything after that gets 429'd.
+MAX_CONTEXT_MESSAGES = int(os.environ.get("MAX_CONTEXT_MESSAGES", "20"))
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 OWNER_PHONE = re.sub(r"\D", "", os.environ.get("OWNER_PHONE") or "923294862198")
@@ -128,9 +165,26 @@ try:
 except Exception as e:
     print(f"Warning: Groq client initialization failed: {e}")
 
+# A Google AI Studio key is 39 chars and starts with "AIzaSy". Anything else
+# (e.g. an "AQ.*" OAuth token from a different Google product) is rejected by
+# generativelanguage.googleapis.com with API_KEY_INVALID on every single call,
+# which silently pushes all traffic onto the Groq fallback and its quota.
+GEMINI_KEY_LOOKS_VALID = bool(GEMINI_API_KEY) and GEMINI_API_KEY.startswith("AIzaSy")
+
 try:
     if GEMINI_API_KEY:
         genai.configure(api_key=GEMINI_API_KEY)
+        if not GEMINI_KEY_LOOKS_VALID:
+            print(
+                f"[CONFIG] WARNING: GEMINI_API_KEY does not look like a Google AI Studio "
+                f"key (got {len(GEMINI_API_KEY)} chars starting '{GEMINI_API_KEY[:6]}', "
+                f"expected 39 chars starting 'AIzaSy'). Gemini will fail on every "
+                f"request and all load will fall to Groq. Get a valid key at "
+                f"https://aistudio.google.com/apikey",
+                flush=True,
+            )
+    else:
+        print("[CONFIG] GEMINI_API_KEY not set — running on Groq only", flush=True)
 except Exception as e:
     print(f"Warning: Gemini client initialization failed: {e}")
 
@@ -260,73 +314,241 @@ GOOGLE REVIEW (MANDATORY):
 After a student confirms their enrollment (Step 10) OR if they express high satisfaction/happiness at any point, you MUST ask them to leave a Google review:
 "By the way — it would mean the world to us if you could drop a quick Google review! Here's the link: https://g.page/r/CdPtj9VpwqqKEBM/review — takes 30 seconds! 😊"
 
-SYSTEM TAGS (Mandatory - hide from user):
-Append the following tags exactly when applicable so the system can track progress:
-- When you reach Step 5 or beyond: <STATE>interest_level=1</STATE>
-- When user asks about price: <STATE>interest_level=2</STATE>
-- When user is ready to enroll/asks about enrollment: <STATE>interest_level=3</STATE>
-- When they share their name: <LEAD_CAPTURED>name=[Full Name]</LEAD_CAPTURED>
-- When they choose a batch: <LEAD_CAPTURED>batch=[Weekend or Weekday]</LEAD_CAPTURED>
-- When they ask to speak to a real person/human/team, ask for a call, or ask to be
-  contacted: <HUMAN_HANDOFF>reason=[what they want]</HUMAN_HANDOFF>
-- When they share their background: <LEAD_CAPTURED>background=[Education/Profession]</LEAD_CAPTURED>
-- When they share how they heard: <LEAD_CAPTURED>interest=[How they heard]</LEAD_CAPTURED>
+=== SYSTEM TAGS — THIS IS THE MOST IMPORTANT TECHNICAL RULE ===
+
+Every reply you write has TWO parts:
+  1. Your message to the student (warm, human, 3-4 lines)
+  2. Tracking tags on the very LAST line
+
+The tags are read by our CRM. If you forget them, the student's name is lost and
+our team never follows up with them. NEVER skip this step.
+
+Tag rules — put ALL applicable tags on the final line, after your message:
+
+- Student tells you their name        -> <LEAD_CAPTURED>name=Ahsan Ali</LEAD_CAPTURED>
+- Student chooses a batch             -> <LEAD_CAPTURED>batch=Weekend</LEAD_CAPTURED>
+- Student shares job/education        -> <LEAD_CAPTURED>background=Software Engineer</LEAD_CAPTURED>
+- Student says how they heard of us   -> <LEAD_CAPTURED>interest=Instagram</LEAD_CAPTURED>
+- You described the program (Step 5+) -> <STATE>interest_level=1</STATE>
+- Student asked about price/fees      -> <STATE>interest_level=2</STATE>
+- Student wants to enroll/book a seat -> <STATE>interest_level=3</STATE>
+- Student wants a human/call/Shayan   -> <HUMAN_HANDOFF>reason=wants a call</HUMAN_HANDOFF>
+
+Write tags EXACTLY as shown — same spelling, same angle brackets, no spaces
+inside the tag names. Never put a tag in the middle of your message. Never
+explain the tags or mention them to the student — they are stripped out before
+the student sees your reply.
+
+If the student has not shared anything trackable yet, just write your message
+with no tag at all. Never write a note explaining that no tag was needed —
+never write anything in brackets about tags. The student sees every word you
+write except the tags themselves.
+
+WORKED EXAMPLES (copy this format exactly):
+
+Student: "Mera naam Ahsan hai"
+You: Ahsan! Bohat khushi hui aap se mil kar 😊 Bataiye, aap SpeakLab ke baare mein kaise soch rahe hain?
+<LEAD_CAPTURED>name=Ahsan</LEAD_CAPTURED>
+
+Student: "Fees kitni hai?"
+You: Ahsan, hamara 8-week program PKR 20,000 ka hai — early bird price. August batch 1st August se shuru ho raha hai aur sirf 20 seats hain 😊
+<STATE>interest_level=2</STATE>
+
+Student: "Mujhe kisi se baat karni hai"
+You: Bilkul! Main abhi apni team ko aapki details bhej deti hoon — koi bohat jald aap se rabta karega 😊
+<HUMAN_HANDOFF>reason=wants to speak to the team</HUMAN_HANDOFF>
+
+Student: "Assalam o alaikum"
+You: Wa alaikum assalam! 😊 Main Sara hoon SpeakLab se. Aap ka naam jaan sakti hoon?
+(no tag needed here — the student has not shared anything trackable yet)
 """
+
+# Reasoning models sometimes leak their scratchpad into the visible content as a
+# <think>/<reasoning> block. Sara must never send that to a WhatsApp user.
+_THINK_BLOCK = re.compile(
+    r"<(think|thinking|reasoning|analysis)>.*?</\1>", re.DOTALL | re.IGNORECASE
+)
+
+
+def _strip_reasoning(text: str) -> str:
+    """Remove any chain-of-thought block a reasoning model left in the reply."""
+    cleaned = _THINK_BLOCK.sub("", text or "")
+    # An unclosed opening tag means everything after it is scratchpad — drop it.
+    open_tag = re.search(r"<(think|thinking|reasoning|analysis)>", cleaned, re.IGNORECASE)
+    if open_tag:
+        cleaned = cleaned[: open_tag.start()]
+    return cleaned.strip()
+
+
+async def _try_nvidia(context_messages: list) -> str:
+    """
+    One NVIDIA NIM attempt against the OpenAI-compatible chat-completions API.
+    Raises on any failure so the caller can fall through to the next provider.
+    """
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages += [m for m in context_messages if m["role"] != "system"]
+
+    payload = {
+        "model": NVIDIA_MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": NVIDIA_MAX_TOKENS,
+        "stream": False,
+    }
+    if NVIDIA_REASONING_EFFORT:
+        payload["reasoning_effort"] = NVIDIA_REASONING_EFFORT
+
+    async with httpx.AsyncClient(timeout=NVIDIA_TIMEOUT) as client:
+        response = await client.post(
+            f"{NVIDIA_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {NVIDIA_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+
+    if response.status_code != 200:
+        # Surface the status code in the message so _is_rate_limit() can spot a 429.
+        raise RuntimeError(f"HTTP {response.status_code}: {response.text[:300]}")
+
+    message = response.json()["choices"][0]["message"]
+    # gpt-oss splits its output: chain-of-thought goes to reasoning_content, the
+    # actual answer to content. Only content is ever shown to the user — a reply
+    # built from reasoning_content would leak Sara's internal deliberation.
+    text = _strip_reasoning(message.get("content") or "")
+    if not text:
+        raise ValueError(
+            "empty content (reasoning consumed the max_tokens budget — "
+            "raise NVIDIA_MAX_TOKENS or lower NVIDIA_REASONING_EFFORT)"
+        )
+    return text
+
+
+async def _try_gemini(context_messages: list) -> str:
+    """One Gemini attempt. Raises on any failure so the caller can fall through."""
+    gemini_model = genai.GenerativeModel(
+        model_name=GEMINI_MODEL,
+        system_instruction=SYSTEM_PROMPT,
+    )
+
+    gemini_history = []
+    for msg in context_messages:
+        if msg["role"] == "system":
+            continue
+        elif msg["role"] == "user":
+            gemini_history.append({"role": "user", "parts": [msg["content"]]})
+        elif msg["role"] == "assistant":
+            gemini_history.append({"role": "model", "parts": [msg["content"]]})
+
+    if not gemini_history:
+        raise ValueError("no user message to send")
+
+    current_user_msg = gemini_history.pop()
+    chat = gemini_model.start_chat(history=gemini_history)
+    response = await chat.send_message_async(current_user_msg["parts"][0])
+
+    text = (response.text or "").strip()
+    if not text:
+        # A safety block or empty candidate returns no text — treat as a failure
+        # so we fall through to Groq rather than sending the user a blank message.
+        raise ValueError("empty response (possible safety block)")
+    return text
+
+
+async def _try_groq(context_messages: list, model: str) -> str:
+    """One Groq attempt against a specific model. Raises on any failure."""
+    groq_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    groq_messages += [m for m in context_messages if m["role"] != "system"]
+
+    chat_completion = await groq_client.chat.completions.create(
+        messages=groq_messages,
+        model=model,
+    )
+    text = (chat_completion.choices[0].message.content or "").strip()
+    if not text:
+        raise ValueError("empty response")
+    return text
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    """True if the exception looks like a 429 / quota exhaustion."""
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if status == 429:
+        return True
+    text = str(exc).lower()
+    return "429" in text or "rate limit" in text or "quota" in text or "resource_exhausted" in text
+
 
 async def generate_ai_response(context_messages: list) -> str:
     """
-    Try Gemini first. If it fails for any reason (quota, error, timeout),
-    silently fall back to Groq. This switching is completely invisible to the user.
+    Try NVIDIA NIM, then Gemini, then Groq's primary model, then Groq's smaller
+    fallback model. Rate-limited attempts are retried once after a short backoff.
+    All switching is invisible to the user.
+
+    Every failure is logged with its provider, model and error type — when the
+    user does see the apology message, the Railway logs say exactly why.
     """
-    # Primary: Gemini
-    try:
-        if GEMINI_API_KEY:
-            gemini_model = genai.GenerativeModel(
-                model_name="gemini-1.5-flash",
-                system_instruction=SYSTEM_PROMPT
-            )
+    attempts = []
+    if NVIDIA_API_KEY:
+        attempts.append(("NVIDIA", NVIDIA_MODEL))
+    # A malformed Gemini key fails identically on every call, so skip it entirely
+    # rather than burning a round trip and log line on every single message.
+    if GEMINI_API_KEY and GEMINI_KEY_LOOKS_VALID:
+        attempts.append(("Gemini", GEMINI_MODEL))
+    attempts.append(("Groq", GROQ_MODEL))
+    if GROQ_FALLBACK_MODEL and GROQ_FALLBACK_MODEL != GROQ_MODEL:
+        attempts.append(("Groq", GROQ_FALLBACK_MODEL))
 
-            gemini_history = []
-            for msg in context_messages:
-                
-                if msg["role"] == "system":
+    last_error = None
+
+    for provider, model in attempts:
+        for retry in range(2):  # one immediate try, one retry after backoff
+            try:
+                if provider == "NVIDIA":
+                    text = await _try_nvidia(context_messages)
+                elif provider == "Gemini":
+                    text = await _try_gemini(context_messages)
+                else:
+                    text = await _try_groq(context_messages, model)
+                print(f"[AI] Response via {provider} ({model})", flush=True)
+                return text
+
+            except Exception as e:
+                last_error = e
+                rate_limited = _is_rate_limit(e)
+                print(
+                    f"[AI] {provider}/{model} failed "
+                    f"({'rate limit' if rate_limited else type(e).__name__}): "
+                    f"{str(e)[:200]}",
+                    flush=True,
+                )
+                # Only a rate limit is worth waiting out; anything else (bad key,
+                # retired model, malformed request) will fail identically on retry.
+                if rate_limited and retry == 0:
+                    await asyncio.sleep(3)
                     continue
-                elif msg["role"] == "user":
-                    gemini_history.append({"role": "user", "parts": [msg["content"]]})
-                elif msg["role"] == "assistant":
-                    gemini_history.append({"role": "model", "parts": [msg["content"]]})
+                break
 
-            current_user_msg = gemini_history.pop()
-            chat = gemini_model.start_chat(history=gemini_history)
-            response = await chat.send_message_async(current_user_msg["parts"][0])
-
-            print("Response via Gemini")
-            return response.text
-
-    except Exception as e:
-        print(f"Gemini failed ({e}). Falling back to Groq...")
-
-    # Fallback: Groq
-    try:
-        groq_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        groq_messages += [m for m in context_messages if m["role"] != "system"]
-
-        chat_completion = await groq_client.chat.completions.create(
-            messages=groq_messages,
-            model="llama-3.3-70b-versatile",
-        )
-        print("Response via Groq (fallback)")
-        return chat_completion.choices[0].message.content
-
-    except Exception as e:
-        print(f"Groq fallback also failed: {e}")
-        return "I'm having a little trouble right now - give me a moment and try again!"
+    print(f"[AI] ALL PROVIDERS FAILED — last error: {last_error}", flush=True)
+    return "I'm having a little trouble right now - give me a moment and try again!"
 
 
 def build_context_messages(conversation_history: list) -> list:
-    """Build the full message list for the AI, with the system prompt prepended."""
+    """
+    Build the message list for the AI, with the system prompt prepended.
+
+    Only the most recent MAX_CONTEXT_MESSAGES turns are included. The full
+    history is still persisted in Supabase — this cap only limits what goes over
+    the wire, keeping each request well inside Groq's 12k tokens/minute free-tier
+    budget so a busy conversation doesn't start getting 429'd.
+    """
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(conversation_history)
+    recent = conversation_history[-MAX_CONTEXT_MESSAGES:] if MAX_CONTEXT_MESSAGES > 0 else conversation_history
+    # Never open on an assistant turn — some providers reject a leading model message.
+    while recent and recent[0].get("role") == "assistant":
+        recent = recent[1:]
+    messages.extend(recent)
     return messages
 
 
@@ -486,6 +708,20 @@ async def lifespan(app: FastAPI):
     print(f"[SECURITY] /broadcast: "
           f"{'PROTECTED' if BROADCAST_SECRET else 'DISABLED — set BROADCAST_SECRET to enable it'}", flush=True)
     print(f"[SECURITY] rate limit: {RATE_LIMIT_MAX} messages / {RATE_LIMIT_WINDOW}s per sender", flush=True)
+
+    # Print the exact provider order this boot will use, so a misconfigured key
+    # is obvious in the logs instead of only showing up as a failed reply.
+    chain = []
+    if NVIDIA_API_KEY:
+        chain.append(f"NVIDIA/{NVIDIA_MODEL}")
+    if GEMINI_API_KEY and GEMINI_KEY_LOOKS_VALID:
+        chain.append(f"Gemini/{GEMINI_MODEL}")
+    chain.append(f"Groq/{GROQ_MODEL}")
+    if GROQ_FALLBACK_MODEL and GROQ_FALLBACK_MODEL != GROQ_MODEL:
+        chain.append(f"Groq/{GROQ_FALLBACK_MODEL}")
+    print(f"[AI] provider chain: {' -> '.join(chain)}", flush=True)
+    if not NVIDIA_API_KEY:
+        print("[AI] WARNING: NVIDIA_API_KEY not set — primary provider disabled", flush=True)
 
     try:
         # Log every job outcome so a silently-dying scheduler is visible in Railway.
@@ -773,6 +1009,17 @@ async def receive_webhook(request: Request):
 
             reply_text = await generate_ai_response(context_messages)
 
+            # Models occasionally echo the prompt's own commentary about tags
+            # (observed: "(no tag needed here — ...)"). That is internal
+            # instruction text and must never reach the student.
+            clean_reply = re.sub(
+                r"^[ \t]*[\(\[][^\)\]]*\btags?\b[^\)\]]*[\)\]][ \t]*$",
+                "",
+                reply_text,
+                flags=re.IGNORECASE | re.MULTILINE,
+            ).strip()
+            reply_text = clean_reply
+
             lead_info = {}
             feedback_info = {}
             referral_info = {}
@@ -981,7 +1228,14 @@ async def receive_webhook(request: Request):
                 "reminders_sent": 0,
             }
 
-            if lead_info.get("name"):       update_data["name"]       = lead_info["name"]
+            # Models sometimes emit a placeholder instead of omitting the tag
+            # (observed: "name=Unknown" on a turn where no name was given).
+            # Writing that to the CRM would look like a real captured lead.
+            captured_name = (lead_info.get("name") or "").strip()
+            if captured_name.lower() in {"unknown", "n/a", "na", "none", "-", "[full name]"}:
+                captured_name = ""
+
+            if captured_name:               update_data["name"]       = captured_name
             if lead_info.get("background"): update_data["background"] = lead_info["background"]
             if lead_info.get("interest"):   update_data["interest"]   = lead_info["interest"]
             if feedback_info.get("feedback"):
@@ -1020,8 +1274,8 @@ async def receive_webhook(request: Request):
                 if new_interest_level is not None:
                     lt_update["interest_level"] = new_interest_level
 
-                if lead_info.get("name"):
-                    lt_update["user_name"] = lead_info["name"]
+                if captured_name:
+                    lt_update["user_name"] = captured_name
 
                 if lt_record:
                     # The lead replied, so restart the 24h/48h follow-up clock.
