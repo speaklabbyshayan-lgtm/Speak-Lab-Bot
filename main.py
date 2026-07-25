@@ -234,13 +234,29 @@ Step 8 → Handle objections confidently but kindly
          experience SpeakLab before deciding. Want details? 🎤"
 Step 9 → Ask which batch suits them better — Weekend or Weekday?
          Example: "We have two batches — weekend and weekday. Which one works better for you?"
-Step 10 → Guide them to enroll: speaklabbyshayan.com/enroll.html or call 0301-4497532
+Step 10 → Guide them to enroll: speaklabbyshayan.com/enroll.html
 
-TALKING TO A REAL PERSON:
-If the user asks to speak to a real human/person/team/Shayan, asks for a call, or asks
-for someone to contact them — reassure them warmly and tell them the team will reach out:
-"Of course! Let me pass your details to our team — someone will reach out to you very soon 😊"
-Never refuse this request.
+NEVER GIVE OUT A PHONE NUMBER (STRICT — NEVER BREAK):
+- NEVER share any phone number, WhatsApp number, or wa.me link with the student.
+- NEVER tell the student to call, message, contact or WhatsApp anyone.
+- You are the point of contact. YOU take their details and OUR TEAM calls THEM.
+- If the student asks for a number ("aapka number kya hai?", "give me your number",
+  "kis number pe rabta karun?"), never give one. Say instead:
+  "Main aap ki details apni team ko bhej deti hoon — woh khud aap se rabta kar lenge 😊
+  Aap ka behtareen waqt kya hota hai baat karne ke liye?"
+
+TALKING TO A REAL PERSON / TAKING THEIR DETAILS:
+If the student asks to speak to a real human/person/team/Shayan, asks for a call, asks
+for a number, or asks for someone to contact them — never refuse, and never hand over a
+number. Instead COLLECT their details so our team can call them. Ask for what is still
+missing, ONE question at a time, in this order:
+  1. Their name (if you don't already have it)
+  2. The best time to call them
+Once you have both, confirm warmly:
+"Perfect {name}! Main aap ki details team ko bhej rahi hoon — woh aap se {time} rabta
+kar lenge 😊"
+Then emit the <HUMAN_HANDOFF> tag so our team is alerted immediately.
+The student's WhatsApp number is captured automatically — never ask them for it.
 
 PRICING RULES (STRICT — NEVER BREAK):
 - Program fee is PKR 20,000 — final, non-negotiable
@@ -280,7 +296,9 @@ FREE SEMINAR:
 - Cost: Completely FREE
 - Limited seats available
 - Perfect for anyone who wants to experience SpeakLab before committing
-- To register → message 0301-4497532
+- To register → YOU register them. Take their name and confirm their seat, then emit
+  <HUMAN_HANDOFF>reason=wants to register for the free seminar</HUMAN_HANDOFF> so our
+  team books it. Never send them to a phone number.
 - Mention this when a student says they want to "think about it" or seems unsure
 
 FREE 2-DAY EXPERIENCE:
@@ -289,7 +307,9 @@ FREE 2-DAY EXPERIENCE:
 - Day 2: Join a live session — watch, listen, participate comfortably. Practice with real students, get coach feedback
 - After 2 days: if they love it, they can enroll in the full August batch
 - Only 5 experience slots available per batch
-- To claim it → send a message to wa.me/923014497532
+- To claim it → YOU reserve the slot for them. Take their name and the best time to
+  call, then emit <HUMAN_HANDOFF>reason=wants the free 2-day experience</HUMAN_HANDOFF>
+  so our team confirms it. Never send them to a phone number.
 - Mention this naturally when a student is hesitant about price or commitment — never pushy
 
 ATTENDING CLASS (important — be clear about this):
@@ -368,6 +388,48 @@ You: Wa alaikum assalam! 😊 Main Sara hoon SpeakLab se. Aap ka naam jaan sakti
 _THINK_BLOCK = re.compile(
     r"<(think|thinking|reasoning|analysis)>.*?</\1>", re.DOTALL | re.IGNORECASE
 )
+
+
+# Business numbers Sara used to hand out, in every shape a model might write them:
+# 0301-4497532, 0301 4497532, 03014497532, +923014497532, wa.me/923014497532 ...
+_CONTACT_PATTERNS = [
+    re.compile(r"https?://\s*wa\.me/\S+", re.IGNORECASE),
+    re.compile(r"\bwa\.me/\S+", re.IGNORECASE),
+    # Any Pakistani mobile written locally (03xx…) or internationally (+92 3xx…),
+    # tolerating spaces/dashes between groups.
+    re.compile(r"\+?9\s*2[\s\-]?3\d{2}[\s\-]?\d{3}[\s\-]?\d{4}"),
+    re.compile(r"\b0\s*3\d{2}[\s\-]?\d{3}[\s\-]?\d{4}\b"),
+]
+# Sentences that only existed to point the student at a number read as broken once
+# the number is removed, so drop the whole "call/message us at ..." clause.
+_CALL_TO_NUMBER = re.compile(
+    r"(?:[^.!?\n]*\b(?:call|contact|message|whatsapp|rabta|raabta)\b[^.!?\n]*)?"
+    r"(?:PHONE_REMOVED)[^.!?\n]*[.!?]?",
+    re.IGNORECASE,
+)
+
+
+def _strip_contact_numbers(text: str) -> str:
+    """
+    Remove phone numbers and wa.me links from a reply, along with the sentence that
+    was pointing the student at them. Sara collects details instead; the owner is
+    notified separately and calls the lead back.
+    """
+    if not text:
+        return text
+    cleaned = text
+    for pattern in _CONTACT_PATTERNS:
+        cleaned = pattern.sub("PHONE_REMOVED", cleaned)
+    if "PHONE_REMOVED" not in cleaned:
+        return text
+    cleaned = _CALL_TO_NUMBER.sub("", cleaned)
+    cleaned = cleaned.replace("PHONE_REMOVED", "")
+    # Tidy the punctuation/whitespace the removal leaves behind.
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"[ \t]+([.,!?])", r"\1", cleaned)
+    cleaned = "\n".join(line.strip(" \t-–—:") for line in cleaned.splitlines())
+    return cleaned.strip()
 
 
 def _strip_reasoning(text: str) -> str:
@@ -1020,6 +1082,12 @@ async def receive_webhook(request: Request):
             ).strip()
             reply_text = clean_reply
 
+            # Last line of defence: strip any business phone number / wa.me link the
+            # model emits anyway. Sara must never send the student off to call someone —
+            # every lead has to come back to the owner through an alert instead.
+            clean_reply = _strip_contact_numbers(clean_reply)
+            reply_text = clean_reply
+
             lead_info = {}
             feedback_info = {}
             referral_info = {}
@@ -1124,6 +1192,11 @@ async def receive_webhook(request: Request):
             human_keywords = [
                 "human", "real person", "agent", "banda", "aap", "shayan", "teacher",
                 "coach", "call me", "call karo", "phone karo", "baat karni hai", "speak to someone",
+                # Asking for a number IS a request to be contacted. Sara no longer gives
+                # one out, so without these the owner would never learn the lead asked —
+                # note "aap" does not match "aapka", which is how most people phrase it.
+                "number", "contact", "contact number", "whatsapp number", "aapka number",
+                "rabta", "raabta", "phone",
             ]
             seminar_keywords = ["seminar", "free experience"]
             ready_keywords = [
@@ -1162,14 +1235,19 @@ async def receive_webhook(request: Request):
                     f"🕐 Time: {now_pkt}"
                 )
 
-            # TRIGGER 3 — Wants a human
+            # TRIGGER 3 — Wants a human. Sara never gives the student a number, so this
+            # alert is the only path to contact — it carries everything the owner needs
+            # to call the lead back, plus a one-tap link to open the chat.
             if wants_human:
+                wants = handoff_info.get("reason") or "wants to talk to the team"
                 owner_alerts.append(
                     f"🚨 NEEDS HUMAN — RESPOND NOW\n\n"
                     f"👤 Name: {user_name}\n"
                     f"📱 Number: {sender_phone}\n"
+                    f"🙋 Wants: {wants}\n"
                     f"💬 Message: \"{message_text}\"\n"
-                    f"🕐 Time: {now_pkt}"
+                    f"🕐 Time: {now_pkt}\n"
+                    f"➡️ Reply: https://wa.me/{sender_phone}"
                 )
 
             # TRIGGER 2 — Shows interest (price / enrollment)
@@ -1195,15 +1273,29 @@ async def receive_webhook(request: Request):
                     f"🕐 Time: {now_pkt}"
                 )
 
-            # When the user wants a human, Sara reassures them and shares the direct
-            # WhatsApp number — on top of the owner alert above.
+            # When the user wants a human, Sara reassures them that the team will call
+            # THEM. We deliberately never hand out a phone number — the lead alert above
+            # is what puts the owner in touch, so contact stays inbound to the business.
             if wants_human:
                 human_line = (
-                    "Of course! I've already notified our team — someone will reach out "
-                    "to you very shortly 😊 You can also directly WhatsApp: 0301-4497532"
+                    "Of course! Main aap ki details apni team ko bhej chuki hoon — "
+                    "koi bohat jald aap se rabta karega 😊"
                 )
-                if "0301-4497532" not in clean_reply:
+                already_reassured = any(
+                    p in clean_reply.lower()
+                    for p in ("rabta kar", "reach out", "get in touch", "contact you")
+                )
+                if not already_reassured:
                     clean_reply = f"{clean_reply}\n\n{human_line}".strip() if clean_reply else human_line
+
+            # A reply that was nothing but a phone number is empty after stripping, and
+            # WhatsApp would reject a blank body. Fall back to the reassurance so the
+            # student always gets an answer.
+            if not clean_reply.strip():
+                clean_reply = (
+                    "Main aap ki details apni team ko bhej rahi hoon — koi bohat jald "
+                    "aap se rabta karega 😊"
+                )
 
             if OWNER_PHONE and sender_phone != OWNER_PHONE:
                 for alert in owner_alerts:
