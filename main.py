@@ -7,6 +7,7 @@ import json
 import hmac
 import hashlib
 import time
+import traceback
 from collections import deque, defaultdict
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, Query, Header
@@ -25,8 +26,23 @@ from mutagen.oggvorbis import OggVorbis
 # Load environment variables
 load_dotenv()
 
-WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN")
-WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
+# Accept BOTH naming conventions. Railway was configured with WHATSAPP_TOKEN /
+# PHONE_NUMBER_ID while this file only ever read WHATSAPP_ACCESS_TOKEN /
+# WHATSAPP_PHONE_NUMBER_ID — which resolved to None, so every Graph call was
+# built as ".../v19.0/None/messages" with "Bearer None" and could never deliver.
+WHATSAPP_ACCESS_TOKEN = (
+    os.environ.get("WHATSAPP_ACCESS_TOKEN")
+    or os.environ.get("WHATSAPP_TOKEN")
+    or os.environ.get("META_ACCESS_TOKEN")
+)
+WHATSAPP_PHONE_NUMBER_ID = (
+    os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
+    or os.environ.get("PHONE_NUMBER_ID")
+)
+# Graph API versions expire roughly two years after release; v19.0 (Jan 2024) is
+# past that, and an expired version fails every request. Overridable so it can be
+# bumped from Railway without a deploy.
+GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v22.0")
 WABA_ID = os.environ.get("WABA_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "speaklab_verify_token")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
@@ -69,11 +85,33 @@ GROQ_FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instan
 MAX_CONTEXT_MESSAGES = int(os.environ.get("MAX_CONTEXT_MESSAGES", "20"))
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-OWNER_PHONE = re.sub(r"\D", "", os.environ.get("OWNER_PHONE") or "923294862198")
+def normalize_msisdn(value: str) -> str:
+    """
+    Graph API requires a bare international MSISDN: digits only, country code
+    included, no '+', no leading zero, no spaces or dashes. Anything else is
+    rejected or silently never delivered.
+      "+92 304 488 1260" -> "923044881260"
+      "03044881260"      -> "923044881260"
+      "00923044881260"   -> "923044881260"
+    """
+    digits = re.sub(r"\D", "", value or "")
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("0"):          # local Pakistani format
+        digits = "92" + digits[1:]
+    return digits
+
+
+OWNER_PHONE = normalize_msisdn(os.environ.get("OWNER_PHONE") or "923044881260")
 # Approved WhatsApp template used to alert the owner about a new lead. Free-form
 # text only reaches the owner inside the 24h window (which is usually closed since
 # the owner rarely messages the bot), so this template is the reliable path.
-OWNER_ALERT_TEMPLATE = os.environ.get("OWNER_ALERT_TEMPLATE", "new_lead_alert")
+OWNER_ALERT_TEMPLATE = os.environ.get("OWNER_ALERT_TEMPLATE", "owner_lead_alert")
+# Meta stores a template under an exact language code. An approved "en_US"
+# template does NOT answer to "en" — that fails with error 132001. Try the
+# configured code first, then the other one, rather than guessing.
+TEMPLATE_LANG = os.environ.get("TEMPLATE_LANG", "en")
+TEMPLATE_LANG_FALLBACKS = list(dict.fromkeys([TEMPLATE_LANG, "en_US", "en"]))
 
 # --- Anti-spam / security config -------------------------------------------
 # Meta signs every webhook with this app secret. When set, forged payloads are
@@ -697,7 +735,8 @@ async def check_reminders():
         response = supabase.table("lead_tracking").select("*").execute()
         leads = response.data or []
     except Exception as e:
-        print(f"[SCHEDULER] ERROR fetching lead_tracking: {e}", flush=True)
+        print(f"[SCHEDULER] ERROR fetching lead_tracking: {type(e).__name__}: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
         return
 
     active = [l for l in leads if not l.get("enrolled")]
@@ -731,24 +770,35 @@ async def check_reminders():
             # 48h final follow-up
             if hours_passed >= 48 and f1_sent and not f2_sent:
                 print(f"[SCHEDULER] {phone}: {hours_passed:.1f}h silent -> sending speaklab_final", flush=True)
-                await send_template_message(phone, "speaklab_final")
-                supabase.table("lead_tracking").update({
-                    "follow_up_2_sent": True
-                }).eq("id", lead["id"]).execute()
-                sent_48h += 1
+                res = await send_template_message(phone, "speaklab_final")
+                # Only record it as sent if Meta actually accepted it. Setting the
+                # flag after a failed send permanently suppresses the retry and
+                # hides the failure — that is how a broken send stays invisible.
+                if res.ok:
+                    supabase.table("lead_tracking").update({
+                        "follow_up_2_sent": True
+                    }).eq("id", lead["id"]).execute()
+                    sent_48h += 1
+                else:
+                    print(f"[SCHEDULER] {phone}: speaklab_final NOT sent — {res.as_dict()}", flush=True)
 
             # 24h caring check-in
             elif hours_passed >= 24 and interest_level >= 1 and not f1_sent:
                 print(f"[SCHEDULER] {phone}: {hours_passed:.1f}h silent, interest={interest_level} "
                       f"-> sending speaklab_followup", flush=True)
-                await send_template_message(phone, "speaklab_followup")
-                supabase.table("lead_tracking").update({
-                    "follow_up_1_sent": True
-                }).eq("id", lead["id"]).execute()
-                sent_24h += 1
+                res = await send_template_message(phone, "speaklab_followup")
+                if res.ok:
+                    supabase.table("lead_tracking").update({
+                        "follow_up_1_sent": True
+                    }).eq("id", lead["id"]).execute()
+                    sent_24h += 1
+                else:
+                    print(f"[SCHEDULER] {phone}: speaklab_followup NOT sent — {res.as_dict()}", flush=True)
 
         except Exception as e:
-            print(f"[SCHEDULER] ERROR on lead {lead.get('phone_number')}: {e}", flush=True)
+            print(f"[SCHEDULER] ERROR on lead {lead.get('phone_number')}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            print(traceback.format_exc(), flush=True)
 
     print(f"[SCHEDULER] check_reminders DONE — {sent_24h} followup, {sent_48h} final", flush=True)
 
@@ -779,8 +829,60 @@ def scheduler_error_listener(event):
         print(f"✅ [SCHEDULER] job '{event.job_id}' completed successfully", flush=True)
 
 
+REQUIRED_ENV_VARS = {
+    # logical name -> the env names we accept for it
+    "WHATSAPP_ACCESS_TOKEN": ("WHATSAPP_ACCESS_TOKEN", "WHATSAPP_TOKEN", "META_ACCESS_TOKEN"),
+    "WHATSAPP_PHONE_NUMBER_ID": ("WHATSAPP_PHONE_NUMBER_ID", "PHONE_NUMBER_ID"),
+    "WABA_ID": ("WABA_ID",),
+    "VERIFY_TOKEN": ("VERIFY_TOKEN",),
+    "OWNER_PHONE": ("OWNER_PHONE",),
+    "SUPABASE_URL": ("SUPABASE_URL",),
+    "SUPABASE_KEY": ("SUPABASE_KEY",),
+    "GROQ_API_KEY": ("GROQ_API_KEY",),
+    "NVIDIA_API_KEY": ("NVIDIA_API_KEY",),
+    "META_APP_SECRET": ("META_APP_SECRET", "APP_SECRET"),
+}
+
+
+def env_presence() -> dict:
+    """
+    Presence only — true/false. Never returns or logs a secret value.
+    Reports which alias actually supplied each value so a wrongly-named Railway
+    variable is immediately obvious.
+    """
+    out = {}
+    for logical, aliases in REQUIRED_ENV_VARS.items():
+        found_via = next((a for a in aliases if os.environ.get(a)), None)
+        out[logical] = {"present": bool(found_via), "found_via": found_via}
+    return out
+
+
+def log_whatsapp_config():
+    """Print the exact WhatsApp config this process will use. No secrets."""
+    print("[CONFIG] ---- WhatsApp send config ----", flush=True)
+    print(f"[CONFIG] graph endpoint      : {graph_messages_url()}", flush=True)
+    print(f"[CONFIG] api version         : {GRAPH_API_VERSION}", flush=True)
+    print(f"[CONFIG] phone_number_id     : {WHATSAPP_PHONE_NUMBER_ID!r}", flush=True)
+    print(f"[CONFIG] access token present: {bool(WHATSAPP_ACCESS_TOKEN)} "
+          f"(len={len(WHATSAPP_ACCESS_TOKEN or '')})", flush=True)
+    print(f"[CONFIG] owner phone (exact) : {OWNER_PHONE!r}", flush=True)
+    print(f"[CONFIG] owner alert template: {OWNER_ALERT_TEMPLATE!r} "
+          f"langs={TEMPLATE_LANG_FALLBACKS}", flush=True)
+    for logical, info in env_presence().items():
+        print(f"[CONFIG] env {logical}: present={info['present']} via={info['found_via']}", flush=True)
+    if not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
+        print("[CONFIG] FATAL: WhatsApp credentials missing — every send WILL fail. "
+              "Set WHATSAPP_ACCESS_TOKEN (or WHATSAPP_TOKEN) and "
+              "WHATSAPP_PHONE_NUMBER_ID (or PHONE_NUMBER_ID) on Railway.", flush=True)
+    if OWNER_PHONE != "923044881260":
+        print(f"[CONFIG] NOTE: OWNER_PHONE is {OWNER_PHONE!r}, not 923044881260 — "
+              "owner alerts are going to a different number.", flush=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    log_whatsapp_config()
+
     # Security posture, visible in Railway logs on every boot.
     print(f"[SECURITY] webhook signature check: "
           f"{'ENABLED' if META_APP_SECRET else 'DISABLED — set META_APP_SECRET to reject forged webhooks'}", flush=True)
@@ -852,92 +954,290 @@ class BroadcastRequest(BaseModel):
     phone_list: List[str]
 
 
-async def send_whatsapp_message(to_phone: str, text: str):
-    async with httpx.AsyncClient() as client:
-        url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-        headers = {
-            "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to_phone,
-            "type": "text",
-            "text": {"body": text},
-        }
-        response = await client.post(url, headers=headers, json=payload)
-        if response.status_code != 200:
-            print(f"Failed to send WhatsApp message: {response.text}")
-        return response
+def graph_messages_url() -> str:
+    """The one place the Graph messages endpoint is built, so every send agrees."""
+    return f"https://graph.facebook.com/{GRAPH_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 
 
-async def send_template_message(to_phone: str, template_name: str):
-    async with httpx.AsyncClient() as client:
-        url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-        headers = {
-            "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-            "Content-Type": "application/json",
+class GraphResult:
+    """
+    Outcome of one Graph API call. Never raises at the call site — callers get a
+    structured result, and everything (status, full body, exception, traceback)
+    has already been printed by the time this is returned.
+    """
+
+    def __init__(self, ok: bool, status: int = 0, body=None, error: str = "", url: str = ""):
+        self.ok = ok
+        self.status = status
+        self.body = body if body is not None else {}
+        self.error = error
+        self.url = url
+
+    def as_dict(self) -> dict:
+        return {
+            "ok": self.ok,
+            "http_status": self.status,
+            "meta_response": self.body,
+            "exception": self.error,
+            "url": self.url,
         }
+
+
+async def post_to_graph(payload: dict, label: str) -> GraphResult:
+    """
+    Single choke point for every outbound WhatsApp send.
+
+    Prints the exact recipient, the exact URL, the HTTP status, the FULL Meta
+    response body, and — on an exception — the full traceback. Nothing about a
+    failed send is ever hidden: a swallowed error here is exactly why
+    "messages delivered" sat at 0 with no trace in the logs.
+    """
+    url = graph_messages_url()
+    to_value = payload.get("to")
+    print(
+        f"[GRAPH] {label} -> to={to_value!r} url={url} "
+        f"phone_number_id={WHATSAPP_PHONE_NUMBER_ID!r} "
+        f"token_present={bool(WHATSAPP_ACCESS_TOKEN)}",
+        flush=True,
+    )
+
+    # Fail loudly instead of posting "Bearer None" to ".../None/messages".
+    missing = []
+    if not WHATSAPP_ACCESS_TOKEN:
+        missing.append("WHATSAPP_ACCESS_TOKEN/WHATSAPP_TOKEN")
+    if not WHATSAPP_PHONE_NUMBER_ID:
+        missing.append("WHATSAPP_PHONE_NUMBER_ID/PHONE_NUMBER_ID")
+    if missing:
+        msg = f"missing env var(s): {', '.join(missing)}"
+        print(f"[GRAPH] {label} ABORTED — {msg}", flush=True)
+        return GraphResult(False, error=msg, url=url)
+    if not to_value:
+        print(f"[GRAPH] {label} ABORTED — empty recipient", flush=True)
+        return GraphResult(False, error="empty recipient", url=url)
+
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(url, headers=headers, json=payload)
+    except Exception as e:
+        # Connection/timeout/DNS failures used to propagate into a caller that
+        # printed only str(e) — no traceback, no payload, undebuggable.
+        print(f"[GRAPH] {label} EXCEPTION {type(e).__name__}: {e}", flush=True)
+        print(f"[GRAPH] {label} payload was: {json.dumps(payload)}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        return GraphResult(False, error=f"{type(e).__name__}: {e}", url=url)
+
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text}
+
+    if response.status_code != 200:
+        # FULL body, not a summary — Meta puts the real cause (132000 param count
+        # mismatch, 132001 wrong language, 131047 closed window, 190 bad token)
+        # in error.code / error.error_data.details.
+        print(f"[GRAPH] {label} FAILED http={response.status_code}", flush=True)
+        print(f"[GRAPH] {label} meta_response={response.text}", flush=True)
+        print(f"[GRAPH] {label} payload={json.dumps(payload)}", flush=True)
+        return GraphResult(False, response.status_code, body, url=url)
+
+    print(f"[GRAPH] {label} OK http=200 meta_response={response.text}", flush=True)
+    return GraphResult(True, response.status_code, body, url=url)
+
+
+async def send_whatsapp_message(to_phone: str, text: str) -> GraphResult:
+    print(f"[SEND TEXT] ENTER to={to_phone!r} len={len(text or '')}", flush=True)
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": normalize_msisdn(to_phone),
+        "type": "text",
+        "text": {"body": text},
+    }
+    return await post_to_graph(payload, f"text->{normalize_msisdn(to_phone)}")
+
+
+async def send_template_message(to_phone: str, template_name: str) -> GraphResult:
+    """Send an approved template that has NO body variables."""
+    print(f"[SEND TEMPLATE] ENTER to={to_phone!r} template={template_name!r}", flush=True)
+    return await send_template_with_params(to_phone, template_name, [])
+
+
+async def send_template_with_params(
+    to_phone: str, template_name: str, params: List[str]
+) -> GraphResult:
+    """
+    Send an approved template, with {{1}}..{{n}} body variables when params are
+    given. Unlike a free-form text message, a template reaches the recipient even
+    when the 24h customer-service window is closed — which is why owner lead
+    alerts must go through here.
+
+    The components array is omitted entirely when there are no params: sending an
+    empty parameters list to a template with zero variables is itself a 132000.
+    """
+    to_phone = normalize_msisdn(to_phone)
+    print(
+        f"[SEND TEMPLATE PARAMS] ENTER to={to_phone!r} template={template_name!r} "
+        f"param_count={len(params)}",
+        flush=True,
+    )
+
+    # WhatsApp rejects template params containing newlines/tabs or runs of 4+
+    # spaces, so collapse all whitespace to single spaces. An empty param is
+    # also rejected — substitute "-".
+    clean_params = [re.sub(r"\s+", " ", str(p)).strip() or "-" for p in params]
+
+    last: GraphResult = GraphResult(False, error="no attempt made")
+    for lang in TEMPLATE_LANG_FALLBACKS:
+        template_obj = {"name": template_name, "language": {"code": lang}}
+        if clean_params:
+            template_obj["components"] = [
+                {
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": p} for p in clean_params],
+                }
+            ]
         payload = {
             "messaging_product": "whatsapp",
+            "recipient_type": "individual",
             "to": to_phone,
             "type": "template",
-            "template": {
-                "name": template_name,
-                "language": {"code": "en"}
-            }
+            "template": template_obj,
         }
-        response = await client.post(url, headers=headers, json=payload)
-        if response.status_code != 200:
-            print(f"[TEMPLATE] FAILED '{template_name}' -> {to_phone}: {response.text}", flush=True)
-        else:
-            print(f"[TEMPLATE] sent '{template_name}' -> {to_phone}", flush=True)
-        return response
+        last = await post_to_graph(payload, f"template[{template_name}/{lang}]->{to_phone}")
+        if last.ok:
+            return last
+
+        # 132001 = template name/language pair not found. Only that error is worth
+        # retrying under a different language code; anything else is a real failure.
+        code = ((last.body or {}).get("error") or {}).get("code")
+        if code != 132001:
+            return last
+        print(
+            f"[SEND TEMPLATE PARAMS] '{template_name}' not found in language "
+            f"'{lang}' (132001) — retrying with next language code",
+            flush=True,
+        )
+
+    return last
 
 
-async def send_template_with_params(to_phone: str, template_name: str, params: List[str]):
+# The trigger labels the owner_lead_alert template's {{1}} slot expects. Longest
+# / most specific first so a reason line can be matched unambiguously.
+ALERT_TYPE_LABELS = [
+    "READY TO ENROLL",
+    "SEMINAR INTEREST",
+    "NEEDS HUMAN",
+    "HOT LEAD",
+    "NEW LEAD",
+]
+
+
+def alert_type_label(reason: str) -> str:
     """
-    Send an approved template that has {{1}}..{{n}} body variables. Unlike a
-    free-form text message, a template reaches the recipient even when the 24h
-    customer-service window is closed — which is why owner lead alerts use it.
+    Reduce a trigger headline ("🚀 READY TO ENROLL — ACT NOW!") to the bare label
+    the template expects ("READY TO ENROLL"). Falls back to NEW LEAD.
     """
-    async with httpx.AsyncClient() as client:
-        url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-        headers = {
-            "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to_phone,
-            "type": "template",
-            "template": {
-                "name": template_name,
-                "language": {"code": "en"},
-                "components": [
-                    {
-                        "type": "body",
-                        # WhatsApp rejects template params containing newlines/tabs or
-                        # runs of 4+ spaces, so collapse all whitespace to single spaces.
-                        "parameters": [
-                            {"type": "text", "text": re.sub(r"\s+", " ", str(p)).strip() or "-"}
-                            for p in params
-                        ],
-                    }
-                ],
-            },
-        }
-        response = await client.post(url, headers=headers, json=payload)
-        if response.status_code != 200:
-            print(f"[TEMPLATE] FAILED '{template_name}' -> {to_phone}: {response.text}", flush=True)
-        else:
-            print(f"[TEMPLATE] sent '{template_name}' -> {to_phone}", flush=True)
-        return response
+    text = (reason or "").upper()
+    for label in ALERT_TYPE_LABELS:
+        if label in text:
+            return label
+    return "NEW LEAD"
+
+
+def build_owner_alert_params(
+    alert_type: str, name: str, phone: str, message: str
+) -> List[str]:
+    """
+    The four body variables of the approved owner_lead_alert template, IN ORDER:
+        Type:    {{1}} trigger label (NEW LEAD / HOT LEAD / NEEDS HUMAN /
+                       SEMINAR INTEREST / READY TO ENROLL)
+        Name:    {{2}} lead name
+        Number:  {{3}} lead WhatsApp number
+        Message: {{4}} the lead's message
+    The template has no timestamp slot. The count must match the approved
+    template exactly — a mismatch is Meta error 132000 and the message is never
+    delivered. If the template is ever edited, change this list to match.
+    """
+    return [
+        alert_type_label(alert_type),
+        str(name or "Unknown"),
+        normalize_msisdn(phone) or "-",
+        (str(message or "-"))[:900],   # Meta caps template params well under this
+    ]
+
+
+async def notify_owner(
+    name: str,
+    phone: str,
+    message: str,
+    when: str,
+    reason: str = "",
+    detail_lines: List[str] = None,
+) -> dict:
+    """
+    Alert the owner about a lead.
+
+    Primary path is the approved owner_lead_alert TEMPLATE, because the owner
+    almost never messages the bot, so the 24h customer-service window is closed
+    and a free-form text is rejected with error 131047 — which is exactly why
+    every owner notification silently failed to deliver.
+
+    The free-form text is still attempted afterwards as a best-effort extra: it
+    carries the full detail (trigger type, wa.me link) and lands whenever the
+    window happens to be open. Its failure is logged, never fatal.
+    """
+    print(
+        f"[OWNER ALERT] ENTER reason={reason!r} lead={phone!r} "
+        f"owner={OWNER_PHONE!r} template={OWNER_ALERT_TEMPLATE!r}",
+        flush=True,
+    )
+    if not OWNER_PHONE:
+        print("[OWNER ALERT] SKIPPED — OWNER_PHONE is not set", flush=True)
+        return {"template": None, "text": None}
+
+    params = build_owner_alert_params(reason, name, phone, message)
+    result = {"template": None, "text": None}
+
+    try:
+        template_res = await send_template_with_params(
+            OWNER_PHONE, OWNER_ALERT_TEMPLATE, params
+        )
+        result["template"] = template_res.as_dict()
+        if not template_res.ok:
+            print(f"[OWNER ALERT] TEMPLATE FAILED — {template_res.as_dict()}", flush=True)
+    except Exception as e:
+        print(f"[OWNER ALERT] TEMPLATE EXCEPTION {type(e).__name__}: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        result["template"] = {"ok": False, "exception": f"{type(e).__name__}: {e}"}
+
+    body = "\n\n".join(detail_lines) if detail_lines else (
+        f"{reason}\n\n👤 {name}\n📱 {phone}\n💬 \"{message}\"\n🕐 {when}"
+    )
+    body = f"{body}\n\n➡️ Reply: https://wa.me/{normalize_msisdn(phone)}"
+    try:
+        text_res = await send_whatsapp_message(OWNER_PHONE, body)
+        result["text"] = text_res.as_dict()
+        if not text_res.ok:
+            print(
+                "[OWNER ALERT] free-form text failed (expected when the 24h window "
+                f"is closed) — {text_res.as_dict()}",
+                flush=True,
+            )
+    except Exception as e:
+        print(f"[OWNER ALERT] TEXT EXCEPTION {type(e).__name__}: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        result["text"] = {"ok": False, "exception": f"{type(e).__name__}: {e}"}
+
+    return result
 
 
 async def download_whatsapp_media(media_id: str):
     async with httpx.AsyncClient() as client:
-        url = f"https://graph.facebook.com/v19.0/{media_id}"
+        url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{media_id}"
         headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
         res = await client.get(url, headers=headers)
         if res.status_code != 200:
@@ -1315,14 +1615,25 @@ async def receive_webhook(request: Request):
                 )
 
             if OWNER_PHONE and sender_phone != OWNER_PHONE:
-                for alert in owner_alerts:
-                    header = alert.split("\n", 1)[0]
+                if owner_alerts:
+                    reason = owner_alerts[0].split("\n", 1)[0]
                     try:
-                        print(f"[OWNER ALERT] {header} — {sender_phone} -> notifying {OWNER_PHONE}", flush=True)
-                        await send_whatsapp_message(OWNER_PHONE, alert)
+                        await notify_owner(
+                            name=user_name,
+                            phone=sender_phone,
+                            message=message_text,
+                            when=now_pkt,
+                            reason=reason,
+                            detail_lines=owner_alerts,
+                        )
                     except Exception as e:
-                        # Log and keep going: a failed owner alert must never crash the bot.
-                        print(f"[OWNER ALERT] FAILED for {sender_phone}: {e}", flush=True)
+                        # The student's own reply is sent further down — an owner
+                        # alert problem must never cost the lead their answer.
+                        print(f"[OWNER ALERT] UNEXPECTED FAILURE for {sender_phone}: "
+                              f"{type(e).__name__}: {e}", flush=True)
+                        print(traceback.format_exc(), flush=True)
+                else:
+                    print(f"[OWNER ALERT] no trigger matched for {sender_phone}", flush=True)
             elif not OWNER_PHONE:
                 print("[OWNER ALERT] SKIPPED — OWNER_PHONE is not set", flush=True)
 
@@ -1408,7 +1719,10 @@ async def receive_webhook(request: Request):
         return {"status": "success"}
 
     except Exception as e:
-        print(f"Error processing webhook event: {e}")
+        # Full traceback: this handler wraps every send, so a bare str(e) here
+        # was hiding the real reason messages never went out.
+        print(f"Error processing webhook event: {type(e).__name__}: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
         return {"status": "error"}
 
 
@@ -1430,10 +1744,14 @@ async def send_broadcast(
     for phone in request.phone_list:
         try:
             full_msg = f"SpeakLab Update!\n\n{request.message}\n\n- SpeakLab Team"
-            await send_whatsapp_message(phone, full_msg)
-            success_count += 1
+            res = await send_whatsapp_message(phone, full_msg)
+            if res.ok:
+                success_count += 1
+            else:
+                print(f"[BROADCAST] not delivered to {phone} — {res.as_dict()}", flush=True)
         except Exception as e:
-            print(f"Broadcast failed for {phone}: {e}")
+            print(f"Broadcast failed for {phone}: {type(e).__name__}: {e}", flush=True)
+            print(traceback.format_exc(), flush=True)
 
     try:
         supabase.table("broadcasts").insert({
@@ -1467,6 +1785,92 @@ async def trigger_followup(request: Request):
     print("🕐 [CRON] /cron/followup triggered — running follow-up check", flush=True)
     await check_reminders()
     return {"status": "followup check completed"}
+
+
+@app.get("/test-owner-alert")
+async def test_owner_alert(
+    to: str = Query(None, description="Override recipient; defaults to OWNER_PHONE"),
+    template: str = Query(None, description="Override template name"),
+):
+    """
+    Fire one owner_lead_alert template at the owner and return the RAW Meta API
+    response, so the exact error code is visible without waiting for a real lead.
+
+    Common codes: 190 = bad/expired token, 132000 = parameter count mismatch,
+    132001 = template name/language not found, 131047 = 24h window closed
+    (free-form only), 100 = bad phone_number_id or unsupported API version.
+    """
+    recipient = normalize_msisdn(to or OWNER_PHONE)
+    template_name = template or OWNER_ALERT_TEMPLATE
+    params = build_owner_alert_params(
+        "NEW LEAD",
+        "Test Lead",
+        "923001234567",
+        "This is a test alert from /test-owner-alert",
+    )
+
+    print(f"[TEST] /test-owner-alert -> {recipient!r} template={template_name!r}", flush=True)
+    result = await send_template_with_params(recipient, template_name, params)
+
+    return {
+        "sent_to": recipient,
+        "owner_phone_configured": OWNER_PHONE,
+        "template": template_name,
+        "languages_tried": TEMPLATE_LANG_FALLBACKS,
+        "param_count": len(params),
+        "params": params,
+        "endpoint": graph_messages_url(),
+        "api_version": GRAPH_API_VERSION,
+        "phone_number_id": WHATSAPP_PHONE_NUMBER_ID,
+        "token_present": bool(WHATSAPP_ACCESS_TOKEN),
+        "result": result.as_dict(),
+    }
+
+
+@app.get("/debug-status")
+async def debug_status():
+    """
+    Health/diagnosis snapshot: scheduler state, lead_tracking row count, and
+    presence (true/false only) of every required env var. Never returns a secret.
+    """
+    jobs = []
+    scheduler_running = False
+    try:
+        scheduler_running = scheduler.running
+        for job in scheduler.get_jobs():
+            jobs.append({
+                "id": job.id,
+                "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+            })
+    except Exception as e:
+        print(f"[DEBUG] scheduler inspection failed: {type(e).__name__}: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
+
+    lead_count = None
+    lead_error = None
+    try:
+        res = supabase.table("lead_tracking").select("id", count="exact").execute()
+        lead_count = res.count if res.count is not None else len(res.data or [])
+    except Exception as e:
+        lead_error = f"{type(e).__name__}: {e}"
+        print(f"[DEBUG] lead_tracking count failed: {lead_error}", flush=True)
+        print(traceback.format_exc(), flush=True)
+
+    return {
+        "scheduler": {"running": scheduler_running, "jobs": jobs},
+        "lead_tracking": {"rows": lead_count, "error": lead_error},
+        "env": env_presence(),
+        "whatsapp": {
+            "api_version": GRAPH_API_VERSION,
+            "endpoint": graph_messages_url(),
+            "phone_number_id": WHATSAPP_PHONE_NUMBER_ID,
+            "owner_phone": OWNER_PHONE,
+            "owner_phone_valid": bool(re.fullmatch(r"\d{10,15}", OWNER_PHONE or "")),
+            "owner_alert_template": OWNER_ALERT_TEMPLATE,
+            "template_languages": TEMPLATE_LANG_FALLBACKS,
+        },
+        "server_time_utc": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.get("/")
